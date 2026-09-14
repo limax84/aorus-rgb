@@ -8,14 +8,17 @@ protocol and the inheritance rules.
 """
 
 import os
+import re
 import sys
 import time
 import json
 import glob
 import copy
+import socket
 import select
 import fcntl
 import signal
+import subprocess
 import unicodedata
 from collections import namedtuple
 
@@ -25,7 +28,13 @@ import evdev
 CONFIG_DIR = os.path.expanduser("~/.config/aorus-rgb")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PID_FILE = os.path.join(CONFIG_DIR, "daemon.pid")
-OMARCHY_THEME_FILE = os.path.expanduser("~/.config/omarchy/current/theme/colors.toml")
+PRESETS_DIR = os.path.join(CONFIG_DIR, "presets")
+# Omarchy theme, newest layout first. `keyboard.rgb` is the hue the theme picks
+# for the backlight itself, so it wins over the generic accent color.
+OMARCHY_THEME_DIRS = [os.path.expanduser("~/.local/state/omarchy/current/theme"),
+                      os.path.expanduser("~/.config/omarchy/current/theme")]
+OMARCHY_THEME_FILES = ("keyboard.rgb", "colors.toml")
+SERVICE = "aorus-rgb.service"
 
 # 101 keys layout mapping (evdev keyname -> Aorus LED position 0..127)
 EVDEV_TO_LED = {
@@ -175,15 +184,20 @@ DEFAULT_CONFIG = {
     "flash_brightness": 10,         # 0 to 10 scale for flash
     "flash_color": [255, 255, 255], # Flash color (white by default)
     "fade_duration": 0.45,          # Duration of flash fade in seconds
-    "custom_keys": {}               # { "KEY_ESC": {"color": [255, 0, 0], "brightness": 10}, ... }
+    "custom_keys": {},              # { "KEY_ESC": {"color": [255, 0, 0], "brightness": 10}, ... }
+    "workspace_key": False,         # Light the digit key of the active Hyprland workspace
+    "workspace_brightness": 10,     # Brightness of that digit, 0 to 10
+    "workspace_dark": False,        # Show it on an unlit keyboard too, at the cost of the 0% CPU mode
 }
 
 
-CONFIG_POLL_INTERVAL = 0.2   # seconds between config reloads
-IDLE_TIMEOUT = 0.2           # select() timeout when no fade is running
+CONFIG_POLL_INTERVAL = 2.0   # seconds between config reloads (SIGUSR1 is the fast path)
+IDLE_TIMEOUT = 0.5           # select() timeout when no fade is running
 FADE_TIMEOUT = 0.01          # select() timeout while animating a fade
 MIN_RETRIGGER_DELAY = 0.08   # ignore a key re-firing within this delay
 HW_FULL_BRIGHTNESS = 50      # matrix mode drives brightness in software
+SUSPEND_GAP = 5.0            # a loop iteration longer than this means we resumed from sleep
+DEVICE_RETRY_DELAY = 2.0     # wait before reopening a keyboard that went away
 
 
 def is_inherit(val):
@@ -217,13 +231,16 @@ def resolve_brightness(raw, fallback):
         return fallback
 
 
-def resolve_key_settings(cfg, raw_bg, global_b):
+def resolve_key_settings(cfg, raw_bg, global_b, ws_pos=None):
     """Resolve the unattenuated color and brightness of every LED position.
 
     First rung of the inheritance chain: a custom key falls back to the keyboard
     background color and/or brightness for each value it leaves to `inherit`.
     Brightness stays on the 0-10 scale rather than being pre-multiplied, so that
     the flash can inherit it in turn. Returns {pos: (raw_color, brightness)}.
+
+    `ws_pos`, the active workspace digit, sits above the custom keys: it keeps
+    the color the cascade resolved and only raises the brightness.
     """
     raw_bg = tuple(raw_bg)
     settings = {pos: (raw_bg, global_b) for pos in VALID_POSITIONS}
@@ -235,14 +252,39 @@ def resolve_key_settings(cfg, raw_bg, global_b):
         parsed = parse_color(cinfo.get("color"), default=None)
         settings[pos] = (tuple(parsed) if parsed is not None else raw_bg,
                          resolve_brightness(cinfo.get("brightness"), global_b))
+
+    if ws_pos in settings:
+        settings[ws_pos] = (settings[ws_pos][0],
+                            resolve_brightness(cfg.get("workspace_brightness"), 10))
     return settings
 
 
-def compute_key_base_colors(key_settings, effective_bg, backlight_on=True):
-    """Compute the resting color of every LED position."""
+def compute_key_base_colors(key_settings, effective_bg, backlight_on=True, lit_positions=()):
+    """Compute the resting color of every LED position.
+
+    `lit_positions` stay lit even when the backlight is off: that is how the
+    workspace indicator can show on an otherwise dark keyboard.
+    """
     if not backlight_on:
-        return {pos: tuple(effective_bg) for pos in VALID_POSITIONS}
+        base = {pos: tuple(effective_bg) for pos in VALID_POSITIONS}
+        base.update({pos: scale_color(*key_settings[pos])
+                     for pos in lit_positions if pos in key_settings})
+        return base
     return {pos: scale_color(col, bri) for pos, (col, bri) in key_settings.items()}
+
+
+def workspace_led_pos(cfg, workspace):
+    """LED position of the digit key naming the active workspace, if any.
+
+    Workspaces are matched by name, so "3" lights KEY_3; "10" lights KEY_0, the
+    digit its Super shortcut actually uses.
+    """
+    if not cfg.get("workspace_key") or workspace is None:
+        return None
+    name = str(workspace).strip()
+    if name == "10":
+        name = "0"
+    return EVDEV_TO_LED.get(f"KEY_{name}") if name.isdigit() else None
 
 
 def compute_key_flash_colors(key_settings, base_map, flash_color, flash_brightness):
@@ -279,15 +321,24 @@ def first_lit_color(*candidates):
 
 Lighting = namedtuple("Lighting", (
     "backlight flash fade_duration brightness flash_brightness "
-    "raw_bg effective_bg hw_flash_color is_dark base_map flash_map state"
+    "raw_bg effective_bg hw_flash_color is_dark base_map flash_map ws_pos"
 ))
 
 
-def resolve_lighting(cfg):
+def resolve_fade_duration(raw):
+    """Fade length in seconds, floored: a zero would divide by zero mid-fade."""
+    try:
+        return max(0.05, float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_CONFIG["fade_duration"]
+
+
+def resolve_lighting(cfg, workspace=None):
     """Resolve a config into everything the render loop needs.
 
     Pure function: the whole inheritance chain (keyboard -> custom key -> flash)
     is settled here, so the daemon loop only has to render and send frames.
+    `workspace` is the active Hyprland workspace, or None when unknown.
     """
     backlight = bool(cfg.get("backlight", True))
     brightness = resolve_brightness(cfg.get("brightness"), 10)
@@ -297,13 +348,21 @@ def resolve_lighting(cfg):
     flash_color = cfg.get("flash_color", [255, 255, 255])
     flash_brightness = cfg.get("flash_brightness", 10)
 
-    key_settings = resolve_key_settings(cfg, raw_bg, brightness)
-    base_map = compute_key_base_colors(key_settings, effective_bg, backlight)
+    # The hardware mode can render a dark keyboard, but not a single lit key,
+    # so the indicator is dropped there unless it was explicitly asked for.
+    dark = effective_bg == [0, 0, 0] and (not backlight or not cfg.get("custom_keys"))
+    ws_pos = workspace_led_pos(cfg, workspace)
+    if ws_pos is not None and dark and not cfg.get("workspace_dark"):
+        ws_pos = None
+
+    key_settings = resolve_key_settings(cfg, raw_bg, brightness, ws_pos)
+    base_map = compute_key_base_colors(key_settings, effective_bg, backlight,
+                                       () if ws_pos is None else (ws_pos,))
 
     return Lighting(
         backlight=backlight,
         flash=bool(cfg.get("flash", True)),
-        fade_duration=float(cfg.get("fade_duration", 0.45)),
+        fade_duration=resolve_fade_duration(cfg.get("fade_duration")),
         brightness=brightness,
         # Global flash brightness, for the hardware mode and the on/off test;
         # in matrix mode each key's own value is already baked into flash_map.
@@ -313,49 +372,261 @@ def resolve_lighting(cfg):
         # The hardware reactive mode is monochrome, so an inherited flash can
         # only fall back to the background color there.
         hw_flash_color=raw_bg if is_inherit(flash_color) else parse_color(flash_color, default=[255, 255, 255]),
-        # The hardware mode can render a dark keyboard, but not custom keys.
-        is_dark=(effective_bg == [0, 0, 0] and (not backlight or not cfg.get("custom_keys"))),
+        is_dark=dark and ws_pos is None,
         base_map=base_map,
         flash_map=compute_key_flash_colors(key_settings, base_map, flash_color, flash_brightness),
-        state=json.dumps(cfg, sort_keys=True),
+        ws_pos=ws_pos,
     )
 
 
 def load_config():
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                res = copy.deepcopy(DEFAULT_CONFIG)
-                res.update(json.load(f))
-                return res
-        except Exception:
-            pass
-    save_config(DEFAULT_CONFIG)
-    return copy.deepcopy(DEFAULT_CONFIG)
+    """Load the config on top of the defaults, dropping keys we no longer know.
+
+    A file we failed to read is never overwritten: the daemon polls this path
+    while the CLI writes it, and a config wiped by a bad read would cost the
+    user every custom key they had set.
+    """
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            stored = json.load(f)
+    except FileNotFoundError:
+        save_config(cfg)
+        return cfg
+    except (OSError, ValueError):
+        return cfg
+    if isinstance(stored, dict):
+        cfg.update({k: v for k, v in stored.items() if k in DEFAULT_CONFIG})
+    return cfg
 
 
 def save_config(cfg):
+    """Write the config atomically, so a concurrent reader never sees a partial file.
+
+    Returns what was actually stored: keys we do not know are dropped here.
+    """
     os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    stored = {k: v for k, v in cfg.items() if k in DEFAULT_CONFIG}
+    tmp = f"{CONFIG_FILE}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(stored, f, indent=2)
+    os.replace(tmp, CONFIG_FILE)
+    return stored
+
+
+def update_config(changes):
+    """Apply changes to the stored config and return the result."""
+    cfg = load_config()
+    cfg.update(changes)
+    return save_config(cfg)
+
+
+# ----------------- DAEMON CONTROL -----------------
+
+def daemon_pid():
+    """PID of the running daemon, or None.
+
+    The command line is checked so that a stale pid file left by a crash cannot
+    make us signal whichever unrelated process inherited that pid.
+    """
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return pid if b"aorus_rgb" in f.read() else None
+    except (OSError, ValueError):
+        return None
+
+
+def is_service_active():
+    try:
+        res = subprocess.run(["systemctl", "--user", "is-active", SERVICE],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        return res.stdout.strip() == "active"
+    except OSError:
+        return False
+
+
+def restart_service():
+    subprocess.run(["systemctl", "--user", "restart", SERVICE])
+
+
+def notify_daemon():
+    """Start the service if needed, then wake its select() so it reloads at once."""
+    if not is_service_active():
+        subprocess.run(["systemctl", "--user", "start", SERVICE])
+    pid = daemon_pid()
+    if pid:
+        try:
+            os.kill(pid, signal.SIGUSR1)
+        except OSError:
+            pass
+
+
+# ----------------- ARGUMENT PARSING & DISPLAY -----------------
+
+def parse_color_arg(text):
+    """Parse a color argument: "inherit", an [r, g, b] list, or None if unrecognized."""
+    if is_inherit(text):
+        return "inherit"
+    if isinstance(text, str) and text.strip().lower() == "theme":
+        # Kept literal so the daemon re-reads the Omarchy accent on every reload.
+        return "theme"
+    return parse_color(text)
+
+
+def parse_brightness_arg(text):
+    """Parse a brightness argument: "inherit", an int 0-10, or None if invalid."""
+    if is_inherit(text):
+        return "inherit"
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        return None
+    return value if 0 <= value <= 10 else None
+
+
+def fmt_color(val):
+    """Format a color value for display ('inherit', 'theme' or [r, g, b])."""
+    if is_inherit(val):
+        return "inherit"
+    if isinstance(val, (list, tuple)):
+        return str(list(val))
+    return str(val)
+
+
+def fmt_brightness(val):
+    """Format a brightness value for display ('inherit' or 'n/10')."""
+    return "inherit" if is_inherit(val) else f"{val}/10"
+
+
+def group_custom_keys(custom_keys):
+    """Group keys sharing the same color and brightness, for display."""
+    groups = {}
+    for kname, cinfo in sorted(custom_keys.items()):
+        label = (fmt_color(cinfo.get("color")), fmt_brightness(cinfo.get("brightness")))
+        groups.setdefault(label, []).append(kname)
+    return groups
+
+
+# ----------------- PRESETS -----------------
+
+# Config keys a preset captures and restores. saved_color rides along so that
+# `on` restores the right hue after a preset that had the backlight off.
+PRESET_KEYS = ("backlight", "brightness", "bg_color", "saved_color", "flash",
+               "flash_brightness", "flash_color", "fade_duration", "custom_keys")
+
+
+def preset_path(name):
+    """Path of a preset, from a user-typed name. Returns None if the name is invalid."""
+    name = str(name).strip().lower()
+    if name.endswith(".json"):
+        name = name[:-5]
+    if not re.fullmatch(r"[a-z0-9_-]+", name):
+        return None
+    return os.path.join(PRESETS_DIR, f"{name}.json")
+
+
+def preset_exists(name):
+    path = preset_path(name)
+    return bool(path) and os.path.exists(path)
+
+
+def read_preset(name):
+    """Load a preset by name, or None if it is missing or unreadable."""
+    path = preset_path(name)
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def write_preset(name, cfg):
+    """Save the preset-relevant part of a config. Returns its data, or None on a bad name."""
+    path = preset_path(name)
+    if not path:
+        return None
+    data = {"name": os.path.basename(path)[:-5], "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    data.update({k: cfg[k] for k in PRESET_KEYS if k in cfg})
+    os.makedirs(PRESETS_DIR, exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+    return data
+
+
+def delete_preset(name):
+    path = preset_path(name)
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    return True
+
+
+def list_presets():
+    """All saved presets as (name, data); data is None when the file is unreadable."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(PRESETS_DIR, "*.json"))):
+        name = os.path.basename(path)[:-5]
+        out.append((name, read_preset(name)))
+    return out
+
+
+def describe_preset(data):
+    """One-line summary of a preset's content."""
+    if not data:
+        return "fichier illisible"
+    return (f"Fond {fmt_color(data.get('bg_color'))} ({fmt_brightness(data.get('brightness'))}) | "
+            f"Flash {fmt_color(data.get('flash_color'))} ({fmt_brightness(data.get('flash_brightness'))}) | "
+            f"{len(data.get('custom_keys', {}))} touche(s) persos")
+
+
+def omarchy_theme_file():
+    """Path of the active Omarchy theme file to read the keyboard hue from."""
+    for directory in OMARCHY_THEME_DIRS:
+        for name in OMARCHY_THEME_FILES:
+            path = os.path.join(directory, name)
+            if os.path.exists(path):
+                return path
+    return None
+
+
+def _hex_to_rgb(text):
+    """[r, g, b] from a #rrggbb or rrggbb string, or None."""
+    clean = text.strip().strip("\"'").lstrip("#")
+    if len(clean) != 6 or any(c not in "0123456789abcdefABCDEF" for c in clean):
+        return None
+    return [int(clean[i:i + 2], 16) for i in (0, 2, 4)]
 
 
 def get_theme_accent_color():
-    """Detect Omarchy active theme accent color."""
-    if os.path.exists(OMARCHY_THEME_FILE):
+    """Keyboard hue of the active Omarchy theme, or the default cyan."""
+    path = omarchy_theme_file()
+    if path:
         try:
-            with open(OMARCHY_THEME_FILE, "r") as f:
+            with open(path, "r") as f:
                 for line in f:
                     line = line.strip()
-                    if line.startswith("accent") or line.startswith("blue"):
-                        val = line.split("=")[-1].strip().strip("\"'")
-                        val_clean = val.lstrip("#")
-                        if len(val_clean) == 6:
-                            return [int(val_clean[0:2], 16), int(val_clean[2:4], 16), int(val_clean[4:6], 16)]
-        except Exception:
+                    if not line or line.startswith("#") and len(line) != 7:
+                        continue
+                    # keyboard.rgb is a bare hex line; colors.toml is key = "#hex".
+                    field, sep, value = line.partition("=")
+                    if sep and field.strip() not in ("accent", "blue"):
+                        continue
+                    rgb = _hex_to_rgb(value if sep else line)
+                    if rgb:
+                        return rgb
+        except OSError:
             pass
-    return [0, 180, 216]
+    return list(DEFAULT_CONFIG["bg_color"])
 
 
 # Color names accepted by parse_color, in French and English.
@@ -442,21 +713,143 @@ def get_keyboard_hid_path():
 
 
 def get_keyboard_input_device():
-    """Locate keyboard evdev node (0414:8007 input0)."""
+    """Open the keyboard evdev node (0414:8007 input0), or None if it is absent.
+
+    Returning None rather than raising lets the daemon wait for the keyboard to
+    come back (suspend, USB reset) instead of dying into a systemd restart loop.
+    """
     by_id = "/dev/input/by-id/usb-GIGABYTE_USB-HID_Keyboard_AP0000000003-event-kbd"
-    if os.path.exists(by_id):
-        try:
-            return evdev.InputDevice(by_id)
-        except Exception:
-            pass
-    for path in sorted(glob.glob("/dev/input/event*")):
+    candidates = [by_id] if os.path.exists(by_id) else []
+    candidates += sorted(glob.glob("/dev/input/event*"))
+    for path in candidates:
         try:
             dev = evdev.InputDevice(path)
-            if "GIGABYTE" in dev.name and ("8007" in str(dev.phys) or "14.0-6/input0" in str(dev.phys)):
-                return dev
-        except Exception:
-            pass
-    return evdev.InputDevice("/dev/input/event6")
+        except OSError:
+            continue
+        if path == by_id or ("GIGABYTE" in dev.name and
+                             ("8007" in str(dev.phys) or "input0" in str(dev.phys))):
+            fcntl.fcntl(dev.fd, fcntl.F_SETFL, os.O_NONBLOCK)
+            return dev
+        dev.close()
+    return None
+
+
+# ----------------- HYPRLAND WORKSPACE WATCHER -----------------
+
+def active_workspace():
+    """Name of the active Hyprland workspace right now, or None."""
+    path = WorkspaceWatcher._socket_dir()
+    return WorkspaceWatcher._query(path) if path else None
+
+
+
+class WorkspaceWatcher:
+    """Follows the active Hyprland workspace over its IPC socket.
+
+    Exposes fileno() so the daemon can select() on it and react to a switch
+    without polling. Stays inert, and keeps retrying quietly, when Hyprland is
+    not running -- the daemon must work the same on a plain session.
+    """
+
+    def __init__(self):
+        self.active = None
+        self.sock = None
+        self.buf = b""
+        self.next_retry = 0.0
+        self.connect()
+
+    @staticmethod
+    def _socket_dir():
+        """Hyprland's runtime directory for the live instance.
+
+        The signature is read from the environment when systemd imported it, and
+        otherwise from the newest instance directory: a user service does not
+        always inherit the compositor's environment.
+        """
+        base = os.path.join(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"), "hypr")
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        if sig and os.path.isdir(os.path.join(base, sig)):
+            return os.path.join(base, sig)
+        dirs = [d for d in glob.glob(os.path.join(base, "*")) if os.path.isdir(d)]
+        return max(dirs, key=os.path.getmtime) if dirs else None
+
+    def connect(self):
+        """Attach to the event socket and read the current workspace once."""
+        self.close()
+        self.next_retry = time.time() + DEVICE_RETRY_DELAY
+        path = self._socket_dir()
+        if not path:
+            return
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(os.path.join(path, ".socket2.sock"))
+            sock.setblocking(False)
+        except OSError:
+            return
+        self.sock = sock
+        self.buf = b""
+        self.active = self._query(path)
+
+    @staticmethod
+    def _query(path):
+        """Ask the command socket for the active workspace name."""
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                sock.connect(os.path.join(path, ".socket.sock"))
+                sock.sendall(b"j/activeworkspace")
+                chunks = []
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            return str(json.loads(b"".join(chunks)).get("name"))
+        except (OSError, ValueError):
+            return None
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def poll(self):
+        """Drain pending events. Returns True when the active workspace changed."""
+        if not self.sock:
+            if time.time() >= self.next_retry:
+                before = self.active
+                self.connect()
+                return self.active != before
+            return False
+        try:
+            data = self.sock.recv(65536)
+        except BlockingIOError:
+            return False
+        except OSError:
+            data = b""
+        if not data:            # Hyprland went away; retry later
+            self.close()
+            self.next_retry = time.time() + DEVICE_RETRY_DELAY
+            return False
+
+        self.buf += data
+        lines, _, self.buf = self.buf.rpartition(b"\n")
+        before = self.active
+        for line in lines.decode("utf-8", "replace").splitlines():
+            event, _, payload = line.partition(">>")
+            if event == "workspace":
+                self.active = payload
+            elif event == "workspacev2":
+                self.active = payload.split(",", 1)[-1]
+            elif event == "focusedmon":
+                self.active = payload.split(",", 1)[-1]
+        return self.active != before
 
 
 class KeyboardController:
@@ -544,24 +937,24 @@ class KeyboardController:
                 self.enter_custom_mode(hw_brightness)
                 _write_frame()
             except Exception:
+                self.current_mode = None
                 return
         self.current_mode = "custom"
         self.current_hw_brightness = hw_brightness
 
 
-def drain_input(input_dev, timeout):
-    """Wait up to `timeout` for key events; return the LED positions just pressed."""
+def drain_input(input_dev):
+    """Read the pending key presses. Returns LED positions, or None if the device died."""
     try:
-        ready, _, _ = select.select([input_dev], [], [], timeout)
-        if not ready:
-            return []
         return [EVDEV_TO_LED[name]
                 for ev in input_dev.read()
                 if ev.type == evdev.ecodes.EV_KEY and ev.value == 1
                 for name in (evdev.ecodes.KEY.get(ev.code),)
                 if name in EVDEV_TO_LED]
-    except Exception:
+    except BlockingIOError:
         return []
+    except OSError:
+        return None
 
 
 def render_frame(lighting, active_fades, now):
@@ -582,8 +975,34 @@ def render_frame(lighting, active_fades, now):
     return frame
 
 
+def theme_stamp(cfg):
+    """Mtime of the Omarchy theme, but only while the background follows it.
+
+    This is what makes `aorus rgb color theme` track the theme instead of
+    freezing the accent it had the day it was set.
+    """
+    bg = cfg.get("bg_color")
+    if not (isinstance(bg, str) and bg.strip().lower() == "theme"):
+        return ""
+    path = omarchy_theme_file()
+    try:
+        return str(os.path.getmtime(path)) if path else ""
+    except OSError:
+        return ""
+
+
+def _wakeup_pipe():
+    """Self-pipe so SIGUSR1 breaks select() instead of only shortening its timeout."""
+    read_fd, write_fd = os.pipe()
+    for fd in (read_fd, write_fd):
+        os.set_blocking(fd, False)
+    signal.set_wakeup_fd(write_fd)
+    return read_fd
+
+
 def run_daemon():
     """Main daemon loop: reload config, resolve lighting, render."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -598,27 +1017,46 @@ def run_daemon():
     signal.signal(signal.SIGTERM, on_exit)
     # SIGUSR1 from the CLI only needs to break the select() below.
     signal.signal(signal.SIGUSR1, lambda signum, frame: None)
+    wake_fd = _wakeup_pipe()
 
     controller = KeyboardController()
-    input_dev = get_keyboard_input_device()
-    fcntl.fcntl(input_dev.fd, fcntl.F_SETFL, os.O_NONBLOCK)
+    workspaces = WorkspaceWatcher()
+    input_dev = None
 
     active_fades = {}  # {led_pos: flash start time}
-    applied_state = None
-    cfg = load_config()
-    last_cfg_check = time.time()
+    cfg, fingerprint, light = load_config(), None, None
+    last_reload = last_tick = 0.0
 
     while True:
-        if time.time() - last_cfg_check > CONFIG_POLL_INTERVAL:
-            cfg = load_config()
-            last_cfg_check = time.time()
+        now = time.time()
+        if now - last_tick > SUSPEND_GAP:
+            # Resumed from sleep, or first pass: the MCU state is unknown again.
+            try:
+                controller.connect()
+            except Exception:
+                controller.current_mode = None
+            fingerprint = None
+        last_tick = now
 
-        light = resolve_lighting(cfg)
+        if input_dev is None:
+            input_dev = get_keyboard_input_device()
+            if input_dev is None:
+                time.sleep(DEVICE_RETRY_DELAY)
+                continue
+
+        if now - last_reload > CONFIG_POLL_INTERVAL:
+            cfg, last_reload = load_config(), now
+
+        current = (json.dumps(cfg, sort_keys=True), workspaces.active, theme_stamp(cfg))
+        changed = current != fingerprint
+        if changed:
+            light, fingerprint = resolve_lighting(cfg, workspaces.active), current
+            active_fades.clear()
+
         flash_on = light.flash and light.flash_brightness > 0
-        changed = light.state != applied_state
 
-        # Keyboard dark and no custom key: the MCU can do the whole effect
-        # itself, at 1000 Hz for 0% CPU and no USB traffic.
+        # Keyboard dark and nothing per-key to show: the MCU can do the whole
+        # effect itself, at 1000 Hz for 0% CPU and no USB traffic.
         if light.is_dark:
             if changed:
                 if flash_on:
@@ -627,31 +1065,49 @@ def run_daemon():
                         color_code=get_hw_color_code(light.hw_flash_color))
                 else:
                     controller.set_hardware_off()
-                applied_state = light.state
-                active_fades.clear()
-            drain_input(input_dev, IDLE_TIMEOUT)
+            timeout = IDLE_TIMEOUT
+        else:
+            # Colored background, custom keys or workspace indicator: matrix mode.
+            if changed:
+                controller.send_frame(light.base_map, hw_brightness=HW_FULL_BRIGHTNESS)
+            timeout = FADE_TIMEOUT if (flash_on and active_fades) else IDLE_TIMEOUT
+
+        pressed = wait_events(input_dev, workspaces, wake_fd, timeout)
+        if pressed is None:
+            input_dev.close()
+            input_dev = None
             continue
 
-        # Colored background or custom keys: we drive the matrix ourselves.
-        if changed:
-            controller.send_frame(light.base_map, hw_brightness=HW_FULL_BRIGHTNESS)
-            applied_state = light.state
-            active_fades.clear()
+        if flash_on and not light.is_dark:
+            now = time.time()
+            for pos in pressed:
+                # Ignore key repeat: restarting a fade that just began looks like a stutter.
+                if now - active_fades.get(pos, 0) > MIN_RETRIGGER_DELAY:
+                    active_fades[pos] = now
+            if active_fades:
+                controller.send_frame(render_frame(light, active_fades, time.time()),
+                                      hw_brightness=HW_FULL_BRIGHTNESS)
 
-        if not flash_on:
-            drain_input(input_dev, IDLE_TIMEOUT)
-            continue
 
-        pressed = drain_input(input_dev, FADE_TIMEOUT if active_fades else IDLE_TIMEOUT)
-        now = time.time()
-        for pos in pressed:
-            # Ignore key repeat: restarting a fade that just began looks like a stutter.
-            if now - active_fades.get(pos, 0) > MIN_RETRIGGER_DELAY:
-                active_fades[pos] = now
+def wait_events(input_dev, workspaces, wake_fd, timeout):
+    """Block until a keypress, a workspace switch, a CLI signal or the timeout.
 
-        if active_fades:
-            controller.send_frame(render_frame(light, active_fades, time.time()),
-                                  hw_brightness=HW_FULL_BRIGHTNESS)
+    Returns the LED positions just pressed, or None if the keyboard went away.
+    """
+    fds = [input_dev, wake_fd] + ([workspaces] if workspaces.sock else [])
+    try:
+        ready, _, _ = select.select(fds, [], [], timeout)
+    except OSError:
+        return None
+
+    if wake_fd in ready:
+        try:
+            os.read(wake_fd, 4096)
+        except OSError:
+            pass
+    if workspaces in ready or not workspaces.sock:
+        workspaces.poll()
+    return drain_input(input_dev) if input_dev in ready else []
 
 
 if __name__ == "__main__":

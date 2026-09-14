@@ -33,6 +33,11 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
   - `checksum` : `(0xFF - sum(bytes[1:8])) & 0xFF`.
 - **Usage dans le projet** : Utilisé dès que le fond du clavier est éteint/noir (`is_dark = True`).
 
+### D. Couleur du thème Omarchy
+- Le thème actif vit dans `~/.local/state/omarchy/current/theme/` (l'ancien `~/.config/omarchy/current/theme/` est conservé en repli).
+- `keyboard.rgb` — un simple `#rrggbb` — est la teinte que le thème destine au clavier ; elle prime sur `accent` de `colors.toml`.
+- Le chemin était auparavant codé en dur sur l'ancien emplacement : `color theme` retombait silencieusement sur le cyan par défaut.
+
 ### B. Mode Matrice Personnalisée (Mode 0x33 & Rapport 0x12)
 - **Activation du mode personnalisé** :
   - Pour basculer depuis un mode matériel (comme Reactive ou Off) vers le contrôle par touche (custom), il faut envoyer **une seule fois** le rapport de mode `0x33` :
@@ -64,22 +69,31 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 
 | Fichier | Rôle |
 |---|---|
-| `src/aorus_rgb.py` | Démon **et** bibliothèque partagée : mapping des touches, parsing des couleurs, résolution de l'héritage, `KeyboardController` (USB HID), boucle de rendu. |
+| `src/aorus_rgb.py` | Démon **et** bibliothèque partagée : mapping des touches, parsing des couleurs, résolution de l'héritage, store de config et de presets, contrôle du service, `KeyboardController` (USB HID), `WorkspaceWatcher` (IPC Hyprland), boucle de rendu. |
+| `src/aorus_tui.py` | Console interactive curses (`aorus rgb config`). Ne parle ni au périphérique ni à systemd directement : elle passe par la bibliothèque. |
 | `bin/aorus-rgb` | CLI. N'écrit que la config, ne parle jamais au périphérique. Importe tout le reste de `aorus_rgb`. |
 | `bin/aorus` | Dispatcher : `aorus rgb …` → `aorus-rgb …`. |
+| `tests/test_aorus_rgb.py` | Tests de régression sans dépendance : `python3 tests/test_aorus_rgb.py`. Couvre la cascade, l'étage workspace, le thème, l'analyse des événements Hyprland et les invariants de la config. Les couches USB et curses en sont absentes (matériel requis). |
 | `install.sh` / `uninstall.sh` | Dépendances, règle udev, copie vers `~/.local/{bin,share}`, service systemd. |
 
 Règles de découpage à respecter :
-- **Une seule source de vérité pour la config** : `CONFIG_DIR`, `DEFAULT_CONFIG`, `load_config()` et `save_config()` vivent dans `src/aorus_rgb.py`. La CLI les importe — ne pas les redéfinir.
+- **Une seule source de vérité, dans `src/aorus_rgb.py`**, pour tout ce que plus d'un appelant utilise : config (`CONFIG_DIR`, `DEFAULT_CONFIG`, `load_config()`, `save_config()`, `update_config()`), presets (`read_preset()`, `write_preset()`, `list_presets()`, `delete_preset()`), contrôle du service (`notify_daemon()`, `is_service_active()`, `restart_service()`, `daemon_pid()`), parsing (`parse_color_arg()`, `parse_brightness_arg()`) et affichage (`fmt_color()`, `fmt_brightness()`, `describe_preset()`). La CLI et la TUI les importent — ne pas les redéfinir.
 - **`bin/aorus-rgb` insère `LOCAL_SRC` puis `REPO_SRC` dans `sys.path`** via `insert(0, …)`, dans cet ordre, pour que le repo prime sur la copie installée dans `~/.local/share/aorus-rgb`. Inverser cette boucle fait silencieusement exécuter l'ancienne version installée lors des tests depuis les sources.
-- Côté CLI, `apply(changes, message)` est le seul chemin d'écriture (sauvegarde, signale le démon, affiche l'état) et `fmt_color()` / `fmt_brightness()` les seuls formateurs d'affichage (ils gèrent `inherit`).
+- Côté CLI, `apply(changes, message)` est le seul chemin d'écriture ; côté TUI, `Console.commit(changes, message)`. Les deux écrivent puis signalent le démon.
+- `install.sh` copie `src/*.py` en bloc : ajouter un module à `src/` suffit, rien à déclarer ailleurs.
 
-### Communication CLI ↔ démon
+### Communication CLI / TUI ↔ démon
 
-- **Configuration** : `~/.config/aorus-rgb/config.json`, relue toutes les `CONFIG_POLL_INTERVAL` secondes.
-- **Presets** : `~/.config/aorus-rgb/presets/<nom>.json`, écrits et lus uniquement par la CLI ; le démon ne les connaît pas.
-- **PID du démon** : `~/.config/aorus-rgb/daemon.pid`.
-- La CLI écrit le JSON puis envoie `SIGUSR1` au démon, ce qui débloque son `select()` : la nouvelle configuration s'applique en moins d'une milliseconde, sans redémarrer le service.
+- **Configuration** : `~/.config/aorus-rgb/config.json`, relue sur `SIGUSR1` et, en filet de sécurité, toutes les `CONFIG_POLL_INTERVAL` secondes.
+- **Presets** : `~/.config/aorus-rgb/presets/<nom>.json`. Le démon ne les connaît pas : un preset est chargé en écrivant ses champs dans la config.
+- **PID du démon** : `~/.config/aorus-rgb/daemon.pid`. `daemon_pid()` vérifie `/proc/<pid>/cmdline` avant de signaler : un fichier PID périmé ne doit jamais faire envoyer `SIGUSR1` au processus qui a hérité de ce PID.
+- L'écrivain écrit le JSON puis envoie `SIGUSR1`, ce qui débloque le `select()` du démon **via un self-pipe** (`signal.set_wakeup_fd`) : sans lui, PEP 475 ferait simplement reprendre l'attente avec le temps restant au lieu de réveiller la boucle.
+
+### Invariants de la config — à ne pas casser
+
+- **`save_config()` écrit dans un fichier temporaire puis `os.replace()`.** Le démon relit ce fichier pendant que la CLI l'écrit ; une écriture en place lui ferait lire du JSON tronqué.
+- **`load_config()` ne réécrit jamais un fichier qu'il n'a pas su lire.** L'ancienne version retombait sur `save_config(DEFAULT_CONFIG)` en cas d'erreur de lecture : une seule lecture malheureuse effaçait toutes les touches personnalisées de l'utilisateur.
+- `save_config()` filtre sur les clés de `DEFAULT_CONFIG` : les réglages devenus obsolètes disparaissent d'eux-mêmes, et une clé inconnue ne survit pas à un enregistrement.
 
 ---
 
@@ -100,7 +114,7 @@ Règles de découpage à respecter :
 
 ## 5. Héritage en cascade (`inherit`)
 
-Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau reprend la valeur du niveau au-dessus pour chaque champ laissé en `inherit`.
+Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau reprend la valeur du niveau au-dessus pour chaque champ laissé en `inherit`. L'indicateur de workspace se greffe au-dessus des touches personnalisées, mais ne touche que l'intensité (§ 7).
 
 - `is_inherit(val)` est le point de vérité unique : `True` pour `None` et pour les chaînes `inherit`, `auto`, `clavier`, `kbl`, `null`, `default` et la chaîne vide.
 - **`none` en est volontairement exclu** : c'est l'alias historique de *noir* dans `NAMED_COLORS` (`aorus rgb color none` éteint le fond). Ne pas le réintroduire dans `is_inherit()` sans traiter la régression sur `cmd_color`.
@@ -110,13 +124,13 @@ Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau r
 
 `resolve_lighting(cfg)` est une fonction pure qui produit un `Lighting` : tout est résolu là, et la boucle du démon n'a plus qu'à rendre et envoyer des trames. Elle enchaîne :
 
-1. `resolve_key_settings(cfg, raw_bg, global_b)` → `{pos: (raw_color, brightness)}`. **Étage 1** : chaque touche personnalisée retombe sur `raw_bg` (couleur de fond non atténuée) et/ou sur l'intensité globale. La brillance reste sur l'échelle 0-10, non pré-multipliée, précisément pour que le flash puisse en hériter ensuite.
-2. `compute_key_base_colors(key_settings, effective_bg, backlight_on)` → couleurs de repos (`raw_color × brightness/10`, via `scale_color`).
+1. `resolve_key_settings(cfg, raw_bg, global_b, ws_pos)` → `{pos: (raw_color, brightness)}`. **Étage 1** : chaque touche personnalisée retombe sur `raw_bg` (couleur de fond non atténuée) et/ou sur l'intensité globale. La brillance reste sur l'échelle 0-10, non pré-multipliée, précisément pour que le flash puisse en hériter ensuite. `ws_pos`, s'il est fourni, écrase ensuite la seule intensité de cette position.
+2. `compute_key_base_colors(key_settings, effective_bg, backlight_on, lit_positions)` → couleurs de repos (`raw_color × brightness/10`, via `scale_color`). `lit_positions` est la porte de sortie qui permet à l'indicateur de workspace de rester allumé alors que le rétroéclairage est coupé.
 3. `compute_key_flash_colors(key_settings, base_map, flash_color, flash_brightness)` → couleur de **pic** du flash, par position. **Étage 2** : un `flash_color` hérité prend la `raw_color` de la touche, un `flash_brightness` hérité prend sa `brightness`. Le pic vaut `base + (cible − base) × facteur`, ce qui reproduit à l'identique le comportement d'un flash qui n'hérite de rien.
 
 Le flash est donc résolu **par touche**, jamais globalement. Les champs `Lighting.hw_flash_color` et `Lighting.flash_brightness` ne servent qu'au mode matériel `0x04`, monochrome par construction, et au test d'activation du flash.
 
-`Lighting.state` est la sérialisation JSON de la config : la boucle ne réémet une trame que lorsque cette chaîne change.
+La boucle ne réémet une trame que lorsque son *empreinte* change : `(config sérialisée, workspace actif, mtime du thème)`. Le mtime du thème n'est calculé que si `bg_color` vaut littéralement `"theme"` — c'est ce qui rend `aorus rgb color theme` réellement dynamique au lieu de figer l'accent du jour où la commande a été tapée.
 
 Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque touche à sa propre intensité de repos — sans effet visible sur une touche déjà à 10/10. Le réglage utile est `flash_color: "inherit"` avec `flash_brightness: 10`.
 
@@ -129,10 +143,36 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
   - **Mode matrice** sinon : `hw_brightness` reste calé à `HW_FULL_BRIGHTNESS` (50) et chaque touche est modulée en RGB logiciel.
 - `drain_input()` attend les frappes et renvoie les positions LED pressées ; `MIN_RETRIGGER_DELAY` filtre la répétition clavier, qui donnerait un flash saccadé.
 - `render_frame()` compose la trame des fondus en cours et retire ceux qui sont terminés.
-- Les constantes de la boucle (`CONFIG_POLL_INTERVAL`, `IDLE_TIMEOUT`, `FADE_TIMEOUT`, `MIN_RETRIGGER_DELAY`, `HW_FULL_BRIGHTNESS`) sont regroupées en tête de `src/aorus_rgb.py`.
+- `wait_events()` est l'unique `select()` : périphérique evdev, socket d'événements Hyprland et self-pipe des signaux y sont attendus ensemble. Il renvoie `None` quand le clavier a disparu, et la boucle le rouvre après `DEVICE_RETRY_DELAY` au lieu de mourir dans une boucle de redémarrage systemd.
+- **Reprise de veille** : une itération plus longue que `SUSPEND_GAP` signifie qu'on sort de suspension. Le contrôleur est reconnecté et l'empreinte remise à `None`, ce qui force le réenvoi d'une trame — sans cela le clavier restait sur l'état que le MCU avait perdu.
+- Les constantes de la boucle (`CONFIG_POLL_INTERVAL`, `IDLE_TIMEOUT`, `FADE_TIMEOUT`, `MIN_RETRIGGER_DELAY`, `HW_FULL_BRIGHTNESS`, `SUSPEND_GAP`, `DEVICE_RETRY_DELAY`) sont regroupées en tête de `src/aorus_rgb.py`.
+- `resolve_fade_duration()` plancher à 0,05 s : une `fade_duration` à zéro dans la config divisait par zéro en plein fondu.
 
 ---
 
-## 7. Commandes CLI
+---
+
+## 7. Intégration Hyprland (indicateur de workspace)
+
+- `WorkspaceWatcher` suit le workspace actif sur la socket d'événements `$XDG_RUNTIME_DIR/hypr/<signature>/.socket2.sock`, et lit l'état initial via `j/activeworkspace` sur `.socket.sock`.
+- La signature vient de `HYPRLAND_INSTANCE_SIGNATURE` quand systemd l'a importée (c'est le cas sous uwsm), sinon du répertoire d'instance le plus récent : un service utilisateur n'hérite pas toujours de l'environnement du compositeur.
+- Événements pris en compte : `workspace>>`, `workspacev2>>` et `focusedmon>>`. Le watcher se reconnecte tout seul si Hyprland redémarre, et reste inerte hors Hyprland.
+- `workspace_led_pos()` fait correspondre le **nom** du workspace à la touche chiffre : `3` → `KEY_3`, et `10` → `KEY_0`, parce que le binding Omarchy est `SUPER + code:N` sur `1..9` puis `0`. Un workspace nommé (`Work`) n'allume rien.
+- L'indicateur **ne modifie que l'intensité** : la touche garde la couleur que la cascade lui a résolue. Il n'est jamais écrit dans `custom_keys` — c'est un étage calculé au rendu, sinon les presets et la config se pollueraient à chaque bascule.
+- Sur un clavier éteint, l'indicateur est **abandonné** pour préserver le mode matériel à 0 % CPU, sauf si `workspace_dark` est vrai : cette option assume explicitement le passage en mode matrice.
+
+---
+
+## 8. Console de configuration (`src/aorus_tui.py`)
+
+- Lancée par `aorus rgb config`. Bibliothèque standard uniquement (`curses`) : aucune dépendance ajoutée au projet.
+- Structure en menus imbriqués, plus un plan du clavier pour les touches personnalisées.
+- `KEYBOARD_ROWS` est la disposition physique affichée ; c'est de la présentation, elle n'a donc rien à faire dans `aorus_rgb.py`. `KEY_COMPOSE` en est volontairement absent : il partage la LED 66 avec `KEY_MENU` et ne serait qu'un second arrêt du curseur sur la même lumière.
+- `Palette` convertit le RGB vers le cube 256 couleurs et alloue les paires curses à la demande : chaque touche s'affiche dans sa vraie couleur résolue.
+- Toute modification est écrite et signalée immédiatement (`Console.commit`), le vrai clavier servant d'aperçu ; `u` annule sur une pile de 30 états.
+
+---
+
+## 9. Commandes CLI
 
 `aorus rgb` sans argument affiche l'état complet et la liste à jour des commandes ; le README en donne les exemples. Ne pas recopier cette liste ici, elle se périmerait.

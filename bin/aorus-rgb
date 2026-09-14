@@ -7,12 +7,6 @@ Run without arguments for the command list.
 
 import os
 import sys
-import json
-import time
-import glob
-import re
-import subprocess
-import signal
 
 # Add library paths. Inserted in reverse order so that REPO_SRC ends up first
 # in sys.path: running from the Dev repo must use the repo sources, not the
@@ -24,70 +18,20 @@ for p in [LOCAL_SRC, REPO_SRC]:
         sys.path.insert(0, p)
 
 from aorus_rgb import (
-    CONFIG_DIR, PID_FILE, EVDEV_TO_LED, KEY_ALIASES,
-    get_theme_accent_color, is_inherit, load_config, parse_color,
-    resolve_keys, resolve_lighting, save_config,
+    PRESET_KEYS, delete_preset, describe_preset, fmt_brightness, fmt_color,
+    group_custom_keys, is_inherit, is_service_active, list_presets, load_config,
+    notify_daemon, parse_brightness_arg, parse_color, parse_color_arg,
+    active_workspace, preset_exists, read_preset, resolve_keys, resolve_lighting,
+    restart_service, update_config, write_preset,
 )
-
-PRESETS_DIR = os.path.join(CONFIG_DIR, "presets")
 
 GREEN, RED, DIM, CYAN, RESET = "\033[1;32m", "\033[1;31m", "\033[1;30m", "\033[1;36m", "\033[0m"
 RULE = "═" * 60
 
 
-def group_custom_keys(custom_keys):
-    """Group keys sharing the same color and brightness, for display."""
-    groups = {}
-    for kname, cinfo in sorted(custom_keys.items()):
-        label = (fmt_color(cinfo.get("color")), fmt_brightness(cinfo.get("brightness")))
-        groups.setdefault(label, []).append(kname)
-    return groups
-
-
-def fmt_color(val):
-    """Format a color value for display ('inherit' or [r, g, b])."""
-    if is_inherit(val):
-        return "inherit"
-    if isinstance(val, (list, tuple)):
-        return str(list(val))
-    return str(val)
-
-def fmt_brightness(val):
-    """Format a brightness value for display ('inherit' or 'n/10')."""
-    if is_inherit(val):
-        return "inherit"
-    return f"{val}/10"
-
-def is_service_active():
-    try:
-        res = subprocess.run(["systemctl", "--user", "is-active", "aorus-rgb.service"],
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        return res.stdout.strip() == "active"
-    except Exception:
-        return False
-
-def ensure_service_running():
-    if not is_service_active():
-        subprocess.run(["systemctl", "--user", "start", "aorus-rgb.service"])
-
-def notify_daemon():
-    ensure_service_running()
-    if os.path.exists(PID_FILE):
-        try:
-            with open(PID_FILE, "r") as f:
-                pid = int(f.read().strip())
-            os.kill(pid, signal.SIGUSR1)
-        except Exception:
-            pass
-
-def restart_service():
-    subprocess.run(["systemctl", "--user", "restart", "aorus-rgb.service"])
-
 def apply(changes, message):
     """Write config changes, wake the daemon, then report the resulting state."""
-    cfg = load_config()
-    cfg.update(changes)
-    save_config(cfg)
+    update_config(changes)
     notify_daemon()
     print(message)
     cmd_status()
@@ -95,9 +39,10 @@ def apply(changes, message):
 
 def cmd_status():
     cfg = load_config()
-    # Same resolution as the daemon, so the status can never drift from what
-    # the keyboard actually does.
-    light = resolve_lighting(cfg)
+    # Same resolution as the daemon, same active workspace, so the status can
+    # never drift from what the keyboard actually does.
+    workspace = active_workspace() if cfg.get("workspace_key") else None
+    light = resolve_lighting(cfg, workspace)
     custom_keys = cfg.get("custom_keys", {})
     flash_desc = f"{fmt_color(cfg.get('flash_color'))} ({fmt_brightness(cfg.get('flash_brightness'))})"
     flash_on = light.flash and light.flash_brightness > 0
@@ -117,6 +62,7 @@ def cmd_status():
     print(f" Effet Flash    : {GREEN + 'ACTIVÉ ' + flash_desc + RESET if flash_on else RED + 'DÉSACTIVÉ' + RESET}")
     print(f" Couleur active : {light.effective_bg if lit else '[0, 0, 0] (éteint)'}")
     print(f" Touches persos : {f'{len(custom_keys)} active(s)' if custom_keys else 'Aucune'}")
+    print(f" Workspace      : {fmt_workspace(cfg, light, workspace)}")
     print(f" Mode détecté   : {mode}")
     print(f" Service systemd: {GREEN + 'Actif' + RESET if is_service_active() else RED + 'Inactif' + RESET}")
     if custom_keys:
@@ -124,6 +70,17 @@ def cmd_status():
         for (col_str, bri_str), keys in group_custom_keys(custom_keys).items():
             print(f"  • {col_str} ({bri_str}) : {', '.join(keys)}")
     print(RULE)
+
+
+def fmt_workspace(cfg, light, workspace):
+    """Describe the workspace indicator: off, waiting for Hyprland, or lit."""
+    if not cfg.get("workspace_key"):
+        return DIM + "Indicateur désactivé" + RESET
+    if workspace is None:
+        return RED + "Activé, mais Hyprland injoignable" + RESET
+    if light.ws_pos is None:
+        return DIM + f"Workspace {workspace} (masqué : clavier éteint)" + RESET
+    return GREEN + f"Workspace {workspace} à {fmt_brightness(cfg.get('workspace_brightness', 10))}" + RESET
 
 
 def cmd_on():
@@ -211,12 +168,16 @@ def cmd_flash(args):
         print(f"Sous-commande flash inconnue: {sub}")
 
 def cmd_color(color_str):
-    rgb = parse_color(color_str)
-    if rgb is None:
+    rgb = parse_color_arg(color_str)
+    if rgb is None or rgb == "inherit":
         print(f"Erreur: Couleur '{color_str}' non reconnue.")
         print("Exemples: theme, black, red, green, blue, cyan, orange, yellow, purple, 028391, '#028391'")
         return
-    if rgb == [0, 0, 0]:
+    if rgb == "theme":
+        # Stored literally so the daemon re-reads the accent on every theme change.
+        apply({"bg_color": "theme", "saved_color": "theme", "backlight": True},
+              "✓ Couleur réglée sur THEME (suit le thème Omarchy actif).")
+    elif rgb == [0, 0, 0]:
         # Black means "off": saved_color is kept so that `on` can restore the hue.
         apply({"bg_color": rgb, "backlight": False}, "✓ Couleur réglée sur NOIR (fond éteint détecté).")
     else:
@@ -237,22 +198,6 @@ def cmd_key_clear():
     count = len(load_config().get("custom_keys", {}))
     apply({"custom_keys": {}},
           f"✓ {count} touche(s) personnalisée(s) réinitialisée(s). Clavier remis en couleur globale.")
-
-def parse_color_arg(text):
-    """Parse a color argument: returns "inherit", an [r, g, b] list, or None if unrecognized."""
-    return "inherit" if is_inherit(text) else parse_color(text)
-
-
-def parse_brightness_arg(text):
-    """Parse a brightness argument: returns "inherit", an int 0-10, or None if invalid."""
-    if is_inherit(text):
-        return "inherit"
-    try:
-        value = int(text)
-    except (TypeError, ValueError):
-        return None
-    return value if 0 <= value <= 10 else None
-
 
 def parse_key_value(args):
     """Parse the <couleur[:luminosité]> [luminosité] arguments of `key`.
@@ -355,94 +300,42 @@ def cmd_key(args):
 
 # ----------------- PRESETS -----------------
 
-# Config keys a preset captures and restores. saved_color rides along so that
-# `on` restores the right hue after a preset that had the backlight off.
-PRESET_KEYS = ("backlight", "brightness", "bg_color", "saved_color", "flash",
-               "flash_brightness", "flash_color", "fade_duration", "custom_keys")
-
-
-def preset_path(name):
-    """Path of a preset, from a user-typed name. Returns None if the name is invalid."""
-    name = name.strip().lower()
-    if name.endswith(".json"):
-        name = name[:-5]
-    if not re.fullmatch(r"[a-z0-9_-]+", name):
-        return None
-    return os.path.join(PRESETS_DIR, f"{name}.json")
-
-
-def preset_exists(name):
-    path = preset_path(name)
-    return bool(path) and os.path.exists(path)
-
-
-def describe_preset(data):
-    """One-line summary of a preset's content."""
-    return (f"Fond {fmt_color(data.get('bg_color'))} ({fmt_brightness(data.get('brightness'))}) | "
-            f"Flash {fmt_color(data.get('flash_color'))} ({fmt_brightness(data.get('flash_brightness'))}) | "
-            f"{len(data.get('custom_keys', {}))} touche(s) persos")
-
-
 def cmd_preset_save(name):
-    path = preset_path(name)
-    if not path:
+    data = write_preset(name, load_config())
+    if not data:
         print(f"Erreur: Nom '{name}' invalide (lettres, chiffres, tirets et underscores seulement).")
         return
-    cfg = load_config()
-    data = {"name": os.path.basename(path)[:-5], "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}
-    data.update({k: cfg[k] for k in PRESET_KEYS if k in cfg})
-    os.makedirs(PRESETS_DIR, exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
-    print(f"✓ Preset '{data['name']}' enregistré ({path}).")
+    print(f"✓ Preset '{data['name']}' enregistré.")
     print(f"  {describe_preset(data)}")
 
 
 def cmd_preset_load(name):
-    path = preset_path(name)
-    if not path or not os.path.exists(path):
-        print(f"Erreur: Preset '{name}' introuvable.")
+    data = read_preset(name)
+    if data is None:
+        print(f"Erreur: Preset '{name}' introuvable ou illisible.")
         cmd_preset_list()
         return
-    try:
-        with open(path) as f:
-            data = json.load(f)
-    except (OSError, ValueError) as err:
-        print(f"Erreur lors de la lecture du preset '{name}': {err}")
-        return
     apply({k: data[k] for k in PRESET_KEYS if k in data},
-          f"✓ Preset '{os.path.basename(path)[:-5]}' chargé et appliqué.")
+          f"✓ Preset '{data.get('name', name)}' chargé et appliqué.")
 
 
 def cmd_preset_list():
-    paths = sorted(glob.glob(os.path.join(PRESETS_DIR, "*.json")))
-    if not paths:
+    presets = list_presets()
+    if not presets:
         print("Aucun preset enregistré.")
         print("Astuce : 'aorus rgb preset save <nom>' enregistre la configuration active.")
         return
-    print(f"Presets disponibles ({len(paths)}) :")
-    for path in paths:
-        name = os.path.basename(path)[:-5]
-        try:
-            with open(path) as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            print(f"  • {name} (fichier illisible)")
-            continue
-        print(f"  • {CYAN}{name}{RESET} ({data.get('saved_at', 'date inconnue')}) : {describe_preset(data)}")
+    print(f"Presets disponibles ({len(presets)}) :")
+    for name, data in presets:
+        stamp = (data or {}).get("saved_at", "date inconnue")
+        print(f"  • {CYAN}{name}{RESET} ({stamp}) : {describe_preset(data)}")
 
 
 def cmd_preset_delete(name):
-    path = preset_path(name)
-    if not path or not os.path.exists(path):
+    if delete_preset(name):
+        print(f"✓ Preset '{name}' supprimé.")
+    else:
         print(f"Erreur: Preset '{name}' introuvable.")
-        return
-    try:
-        os.remove(path)
-    except OSError as err:
-        print(f"Erreur lors de la suppression : {err}")
-        return
-    print(f"✓ Preset '{os.path.basename(path)[:-5]}' supprimé.")
 
 
 def cmd_preset(args):
@@ -470,8 +363,37 @@ def cmd_preset(args):
         cmd_preset_list()
 
 
+# ----------------- WORKSPACE INDICATOR -----------------
+
+def cmd_workspace(args):
+    """Highlight the digit key of the active Hyprland workspace."""
+    cfg = load_config()
+    sub = args[0].lower().strip() if args else "toggle"
+
+    if sub in ("on", "off", "toggle"):
+        state = not cfg.get("workspace_key") if sub == "toggle" else sub == "on"
+        apply({"workspace_key": state},
+              f"✓ Indicateur de workspace {'ACTIVÉ' if state else 'DÉSACTIVÉ'}.")
+    elif sub == "dark":
+        state = not cfg.get("workspace_dark") if len(args) < 2 else args[1].lower() == "on"
+        apply({"workspace_dark": state},
+              f"✓ Indicateur sur clavier éteint {'ACTIVÉ (coûte le mode 0 % CPU)' if state else 'DÉSACTIVÉ'}.")
+    elif sub in ("brightness", "intensity"):
+        val = parse_brightness_arg(args[1]) if len(args) > 1 else None
+        if not isinstance(val, int):
+            print("Usage: aorus rgb workspace brightness <0-10>")
+            return
+        apply({"workspace_brightness": val, "workspace_key": True},
+              f"✓ Intensité du workspace actif réglée à {val}/10.")
+    else:
+        print("Usage: aorus rgb workspace on | off | toggle")
+        print("       aorus rgb workspace brightness <0-10>")
+        print("       aorus rgb workspace dark [on|off]")
+
+
 USAGE = """
 Commandes disponibles :
+  aorus rgb config                       - Console de configuration interactive
   aorus rgb on | off | toggle            - Allume / éteint le rétroéclairage
   aorus rgb brightness <0-10>            - Intensité du clavier
   aorus rgb color <couleur>              - Couleur globale (theme, red, cyan, 028391, #hex)
@@ -483,6 +405,8 @@ Commandes disponibles :
   aorus rgb preset save|load|delete <nom> - Configurations enregistrées
   aorus rgb preset list
   aorus rgb <nom-de-preset>              - Charge un preset
+  aorus rgb workspace on | off           - Éclaire le chiffre du workspace actif
+  aorus rgb workspace brightness <0-10> | dark [on|off]
   aorus rgb status | restart
 
 'inherit' (ou 'auto', 'null', vide) hérite du niveau au-dessus.
@@ -508,7 +432,10 @@ def main():
         return
 
     sub, rest = args[0].lower(), args[1:]
-    if sub == "on":
+    if sub in ("config", "ui", "tui"):
+        from aorus_tui import run_tui
+        run_tui()
+    elif sub == "on":
         cmd_on()
     elif sub == "off":
         cmd_off()
@@ -524,6 +451,8 @@ def main():
         cmd_key(rest)
     elif sub == "preset":
         cmd_preset(rest)
+    elif sub in ("workspace", "ws"):
+        cmd_workspace(rest)
     elif sub == "status":
         cmd_status()
     elif sub == "restart":

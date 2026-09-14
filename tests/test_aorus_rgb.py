@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""Regression tests for the parts that break silently: the inheritance cascade,
+the workspace rung, the theme lookup and the config store.
+
+No test framework, no dependency beyond the daemon's own: `python3 tests/test_aorus_rgb.py`.
+The USB and curses layers are not covered here -- they need the real hardware.
+"""
+
+import copy
+import json
+import os
+import select
+import socket
+import sys
+import tempfile
+import threading
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+import aorus_rgb as A  # noqa: E402
+
+FAILURES = []
+
+
+def check(name, condition, detail=""):
+    print(("  ok   " if condition else "  FAIL ") + name + ("" if condition else f"  <- {detail}"))
+    if not condition:
+        FAILURES.append(name)
+
+
+def pos(key):
+    return A.EVDEV_TO_LED[key]
+
+
+def test_inheritance():
+    print("héritage en cascade")
+    base = copy.deepcopy(A.DEFAULT_CONFIG)
+    cfg = dict(base, bg_color=[0, 220, 255], brightness=10,
+               custom_keys={"KEY_ESC": {"color": [255, 0, 0], "brightness": 10}})
+    light = A.resolve_lighting(cfg)
+    check("la touche perso garde sa couleur", light.base_map[pos("KEY_ESC")] == (255, 0, 0))
+    check("les autres touches suivent le fond", light.base_map[pos("KEY_A")] == (0, 220, 255))
+
+    inherited = A.resolve_lighting(dict(cfg, flash_color="inherit", flash_brightness=10))
+    check("le flash hérite par touche", inherited.flash_map[pos("KEY_ESC")] == (255, 0, 0))
+
+    check("'none' reste noir, pas un héritage",
+          A.parse_color("none") == [0, 0, 0] and not A.is_inherit("none"))
+    check("les synonymes d'héritage sont reconnus",
+          all(A.is_inherit(v) for v in (None, "inherit", "auto", "null", "")))
+
+
+def test_fade_duration():
+    print("durée de fondu")
+    base = copy.deepcopy(A.DEFAULT_CONFIG)
+    zero = A.resolve_lighting(dict(base, fade_duration=0))
+    check("une durée nulle est bornée", zero.fade_duration == 0.05, zero.fade_duration)
+    A.render_frame(zero, {11: 0.0}, 1.0)   # divisait par zéro avant le plancher
+    check("une durée illisible retombe sur le défaut",
+          A.resolve_lighting(dict(base, fade_duration="x")).fade_duration == 0.45)
+
+
+def test_workspace():
+    print("indicateur de workspace")
+    base = copy.deepcopy(A.DEFAULT_CONFIG)
+    cfg = dict(base, bg_color=[0, 220, 255], brightness=2,
+               workspace_key=True, workspace_brightness=10)
+
+    check("le workspace actif passe à 10/10",
+          A.resolve_lighting(cfg, "3").base_map[pos("KEY_3")] == (0, 220, 255))
+    check("les autres chiffres gardent leur réglage",
+          A.resolve_lighting(cfg, "3").base_map[pos("KEY_4")] == (0, 44, 51))
+    colored = A.resolve_lighting(
+        dict(cfg, custom_keys={"KEY_3": {"color": [255, 0, 0], "brightness": 1}}), "3")
+    check("l'indicateur ne change que l'intensité", colored.base_map[pos("KEY_3")] == (255, 0, 0))
+    check("le workspace 10 vise la touche 0", A.resolve_lighting(cfg, "10").ws_pos == pos("KEY_0"))
+    check("un workspace nommé n'allume rien", A.resolve_lighting(cfg, "Work").ws_pos is None)
+    check("désactivé, aucun effet",
+          A.resolve_lighting(dict(cfg, workspace_key=False), "3").ws_pos is None)
+
+    dark = dict(base, backlight=False, workspace_key=True)
+    check("clavier éteint : le mode matériel 0 % CPU est préservé",
+          A.resolve_lighting(dark, "3").is_dark)
+    forced = A.resolve_lighting(dict(dark, workspace_dark=True), "3")
+    check("workspace_dark bascule en mode matrice", not forced.is_dark)
+    check("workspace_dark allume bien le chiffre", forced.base_map[pos("KEY_3")] != (0, 0, 0))
+    check("workspace_dark laisse le reste éteint", forced.base_map[pos("KEY_A")] == (0, 0, 0))
+
+
+def test_theme():
+    print("thème Omarchy")
+    base = copy.deepcopy(A.DEFAULT_CONFIG)
+    if not A.omarchy_theme_file():
+        print("  (ignoré : aucun thème Omarchy installé)")
+        return
+    check("bg_color 'theme' se résout au rendu",
+          A.resolve_lighting(dict(base, bg_color="theme")).raw_bg == A.get_theme_accent_color())
+    check("l'empreinte suit le thème", A.theme_stamp(dict(base, bg_color="theme")) != "")
+    check("l'empreinte est vide sur une couleur fixe",
+          A.theme_stamp(dict(base, bg_color=[1, 2, 3])) == "")
+
+
+def test_config_store():
+    print("stockage de la configuration")
+    directory = tempfile.mkdtemp()
+    A.CONFIG_DIR, A.CONFIG_FILE = directory, os.path.join(directory, "config.json")
+
+    precious = dict(copy.deepcopy(A.DEFAULT_CONFIG),
+                    custom_keys={f"KEY_F{i}": {"color": [1, 2, 3], "brightness": 5}
+                                 for i in range(1, 13)})
+    A.save_config(precious)
+
+    corrupt = '{"backlight": tr'
+    with open(A.CONFIG_FILE, "w") as f:
+        f.write(corrupt)
+    check("une config illisible n'est jamais écrasée",
+          A.load_config()["custom_keys"] == {} and open(A.CONFIG_FILE).read() == corrupt)
+
+    A.save_config(precious)
+    check("les clés inconnues sont purgées", "enabled" not in A.update_config({"enabled": True}))
+    check("les réglages survivent à l'écriture", len(A.load_config()["custom_keys"]) == 12)
+
+    # Le démon relit ce fichier pendant que la CLI l'écrit : aucune lecture ne
+    # doit tomber sur du JSON tronqué.
+    stop, seen = [False], []
+
+    def reader():
+        while not stop[0]:
+            seen.append(len(A.load_config().get("custom_keys", {})))
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    for i in range(200):
+        A.save_config(dict(precious, brightness=i % 11))
+    stop[0] = True
+    thread.join()
+    check(f"{len(seen)} lectures concurrentes, aucune config vide",
+          seen.count(0) == 0, f"{seen.count(0)} lectures vides")
+
+
+def test_workspace_events():
+    print("analyse des événements Hyprland")
+    server, client = socket.socketpair()
+    client.setblocking(False)
+    watcher = A.WorkspaceWatcher.__new__(A.WorkspaceWatcher)
+    watcher.active, watcher.sock, watcher.buf, watcher.next_retry = "1", client, b"", 0.0
+
+    def send(payload):
+        server.sendall(payload)
+        select.select([watcher], [], [], 0.5)
+        return watcher.poll()
+
+    check("workspace>>", send(b"workspace>>3\n") and watcher.active == "3")
+    check("workspacev2>>", send(b"workspacev2>>7,7\n") and watcher.active == "7")
+    check("focusedmon>>", send(b"focusedmon>>eDP-1,2\n") and watcher.active == "2")
+    check("les autres événements sont ignorés",
+          not send(b"openwindow>>a,b,c,d\nactivewindow>>x,y\n") and watcher.active == "2")
+    check("un workspace identique n'est pas un changement", not send(b"workspace>>2\n"))
+    check("un lot d'événements est traité",
+          send(b"activewindow>>a,b\nworkspace>>4\nopenwindow>>z\n") and watcher.active == "4")
+
+    server.sendall(b"workspace>>")          # ligne coupée entre deux paquets
+    select.select([watcher], [], [], 0.5)
+    watcher.poll()
+    check("une ligne partielle est mise en attente", watcher.active == "4")
+    check("une ligne partielle est complétée", send(b"5\n") and watcher.active == "5")
+
+    server.close()
+    select.select([watcher], [], [], 0.5)
+    watcher.poll()
+    check("la disparition d'Hyprland est gérée", watcher.sock is None)
+
+
+def main():
+    for test in (test_inheritance, test_fade_duration, test_workspace, test_theme,
+                 test_workspace_events, test_config_store):
+        test()
+    print(f"\n{len(FAILURES)} échec(s)" + (f" : {', '.join(FAILURES)}" if FAILURES else ""))
+    return 1 if FAILURES else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

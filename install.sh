@@ -46,9 +46,9 @@ fi
 # 3. Copie du démon dans ~/.local/share/aorus-rgb
 echo "[3/5] Installation du démon dans ~/.local/share/aorus-rgb..."
 mkdir -p "$HOME/.local/share/aorus-rgb"
-cp "$REPO_DIR/src/aorus_rgb.py" "$HOME/.local/share/aorus-rgb/aorus_rgb.py"
+cp "$REPO_DIR"/src/*.py "$HOME/.local/share/aorus-rgb/"
 chmod +x "$HOME/.local/share/aorus-rgb/aorus_rgb.py"
-echo "✓ Démon installé."
+echo "✓ Démon et console installés."
 
 # 4. Installation des binaires CLI dans ~/.local/bin
 echo "[4/5] Installation des commandes CLI dans ~/.local/bin..."

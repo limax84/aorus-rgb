@@ -6,12 +6,14 @@ Contrôleur de rétroéclairage et effet réactif touche-par-touche pour ordinat
 
 ## ✨ Fonctionnalités
 
+- 🖥️ **Console de configuration** : `aorus rgb config` ouvre une interface dans le terminal, avec un plan du clavier où l'on peint les touches au curseur.
 - 💡 **Rétroéclairage** : allumage, extinction, intensité de 0 à 10.
 - 🎨 **Couleurs** : par nom (`cyan`, `purple`, `red`…), par code hexadécimal (`#00b4d8`, `00b4d8`), ou `theme` pour suivre le thème Omarchy actif.
 - 🌈 **Coloration par touche** : couleur et intensité fixes sur les touches de votre choix, par-dessus la couleur globale.
 - ⚡ **Flash réactif** : la touche frappée s'illumine puis revient en fondu vers sa couleur de repos.
 - 🧬 **Héritage en cascade** : clavier → touche → flash. Ce qu'on laisse en `inherit` suit le niveau au-dessus, donc un flash hérité prend la couleur *de la touche frappée*.
 - 💾 **Presets** : configurations complètes enregistrées et rappelées par un nom.
+- 🪟 **Indicateur de workspace** : sous Hyprland, la touche chiffre du workspace actif passe à pleine intensité.
 - 🚀 **Zéro CPU en fond noir** : bascule automatique sur le mode réactif matériel (1000 Hz, 0 % CPU, aucun paquet USB) quand le clavier est éteint.
 - 🌊 **Fondu sans clignotement** : interpolation *smoothstep* calibrée sur la bande passante du contrôleur (~93 ms par trame).
 - 🔄 **Rechargement instantané** : le démon recharge ses réglages en moins d'une milliseconde, sans redémarrage.
@@ -36,6 +38,43 @@ Désinstallation : `./uninstall.sh`.
 
 `aorus rgb <commande>` et `aorus-rgb <commande>` sont équivalents. Sans argument, la commande affiche l'état complet et la liste des commandes.
 
+### Console de configuration
+
+```bash
+aorus rgb config                  # Ouvre la console interactive
+```
+
+Une interface plein écran qui reste ouverte tant qu'on ne la quitte pas. Elle est
+organisée en menus — rétroéclairage, flash, touches, presets, intégration OS — et
+**chaque modification part vers le clavier immédiatement** : le vrai clavier est
+l'aperçu. `u` annule la dernière action, `q` revient en arrière puis quitte.
+
+L'entrée « Touches personnalisées » ouvre un plan du clavier où chaque touche
+s'affiche dans sa couleur réelle :
+
+```
+ Esc  F1  F2  F3  F4  F5  F6  F7  F8  F9 F10 F11 F12   Pau Del Hom PgU PgD End
+  `   1   2   3   4   5   6   7   8   9   0   -   =  Bks   Num  /   *   -
+ Tab  Q   W   E   R   T   Y   U   I   O   P   [   ]   \     7   8   9   +
+ Cap  A   S   D   F   G   H   J   K   L   ;   '  Ent    4   5   6
+ Sft  <   Z   X   C   V   B   N   M   ,   .   /  Sft  ↑     1   2   3  Ent
+ Ctl  Fn Sup Alt Spc AGr Mnu Ctl  ←   ↓   →     0   .
+```
+
+| Touche | Effet |
+|---|---|
+| `←→↑↓` | Déplacer le curseur |
+| `espace` | Marquer / démarquer une touche (les actions s'appliquent à toutes les marques) |
+| `g` | Marquer un groupe entier (`wasd`, `fkeys`, `modifiers`, `nav`…) |
+| `a` | Tout marquer / tout démarquer |
+| `c` / `b` | Couleur / intensité des touches visées |
+| `p` | Mode pinceau : on choisit une couleur, puis chaque déplacement peint la touche traversée |
+| `r` | Réinitialiser (retour à la couleur globale) |
+| `u` | Annuler |
+| `q` | Retour au menu |
+
+La console demande un terminal d'au moins 82 × 22.
+
 ### Rétroéclairage
 
 ```bash
@@ -43,6 +82,7 @@ aorus rgb status                  # État complet du clavier
 aorus rgb on | off | toggle       # Allume, éteint, alterne
 aorus rgb brightness 5            # Intensité 0 à 10
 aorus rgb color cyan              # Couleur globale : nom, #hex, ou "theme"
+aorus rgb color theme             # Suit le thème Omarchy, y compris ses changements
 ```
 
 ### Coloration par touche
@@ -87,6 +127,9 @@ clavier (bg_color + brightness)
           └─> flash (flash_color + flash_brightness)
 ```
 
+L'indicateur de workspace se greffe par-dessus la touche personnalisée, mais ne
+touche que l'intensité : la couleur continue de descendre par la cascade.
+
 ```bash
 aorus rgb key wasd red:10         # Rouge, intensité 10 : rien n'est hérité
 aorus rgb key wasd red:           # Rouge, intensité héritée du clavier
@@ -112,6 +155,22 @@ aorus rgb preset list             # Presets disponibles, avec leur contenu
 aorus rgb preset delete gaming
 ```
 
+### Indicateur de workspace (Hyprland)
+
+La touche du chiffre correspondant au workspace actif passe à pleine intensité —
+le même chiffre que `Super + N`. Elle **garde sa couleur** : seule l'intensité
+change, donc la personnalisation des chiffres est préservée.
+
+```bash
+aorus rgb workspace on | off | toggle
+aorus rgb workspace brightness 10   # Intensité de la touche active
+aorus rgb workspace dark on         # Montrer l'indicateur même clavier éteint
+```
+
+> Par défaut, un clavier éteint reste en mode matériel (0 % CPU) et l'indicateur
+> est masqué. `workspace dark on` l'affiche quand même, au prix du passage en
+> mode matrice. Un workspace nommé (plutôt que numéroté) n'allume rien.
+
 ### Service
 
 ```bash
@@ -124,6 +183,8 @@ systemctl --user status aorus-rgb.service
 ## 🛠️ Fonctionnement
 
 Le démon lit `~/.config/aorus-rgb/config.json`, résout la cascade d'héritage, et pilote le contrôleur LED (interface USB HID 3) selon deux modes : le mode matériel `0x04`, monochrome mais gratuit en CPU, quand le clavier est noir sans touche personnalisée ; le mode matrice `0x33`/`0x12` sinon, qui transmet les 128 positions de LED par trame.
+
+Il n'émet une trame que lorsque quelque chose change réellement — configuration, workspace actif ou thème — et attend le reste du temps dans un `select()` : au repos, sa consommation CPU est nulle.
 
 Le protocole USB, le mapping des touches et les règles d'héritage sont documentés en détail dans [AGENTS.md](AGENTS.md).
 
