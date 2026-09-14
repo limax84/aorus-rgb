@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""
-AORUS RGB Keyboard Controller & Reactive Lighting Daemon.
-Specifically targets Aorus 17X (0414:8007 keyboard controller).
-Supports:
-  - Backlight ON/OFF
-  - Backlight intensity (0-10)
-  - Keypress Flash ON/OFF
-  - Flash intensity (0-10)
-  - Flash custom color
-  - Automatic color detection (black/off vs color)
+"""AORUS RGB keyboard controller and reactive lighting daemon (Aorus 17X, USB 0414:8007).
+
+Drives the backlight, the per-key colors and the keypress flash, resolving the
+`inherit` chain (keyboard -> custom key -> flash) on every config reload. Also
+serves as the library behind the `aorus-rgb` CLI. See AGENTS.md for the USB
+protocol and the inheritance rules.
 """
 
 import os
@@ -16,9 +12,13 @@ import sys
 import time
 import json
 import glob
+import copy
 import select
 import fcntl
 import signal
+import unicodedata
+from collections import namedtuple
+
 import hid
 import evdev
 
@@ -26,8 +26,6 @@ CONFIG_DIR = os.path.expanduser("~/.config/aorus-rgb")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PID_FILE = os.path.join(CONFIG_DIR, "daemon.pid")
 OMARCHY_THEME_FILE = os.path.expanduser("~/.config/omarchy/current/theme/colors.toml")
-
-import unicodedata
 
 # 101 keys layout mapping (evdev keyname -> Aorus LED position 0..127)
 EVDEV_TO_LED = {
@@ -72,7 +70,7 @@ EVDEV_TO_LED = {
     "KEY_KP0": 102, "KEY_KPDOT": 108
 }
 
-VALID_POSITIONS = sorted(list(set(EVDEV_TO_LED.values())))
+VALID_POSITIONS = sorted(set(EVDEV_TO_LED.values()))
 
 # Human-friendly French & English key name aliases (normalized without accents)
 KEY_ALIASES = {
@@ -163,15 +161,8 @@ def resolve_keys(key_spec):
         elif up in EVDEV_TO_LED:
             if up not in result:
                 result.append(up)
-        elif f"KEY_{up}" in EVDEV_TO_LED:
-            k = f"KEY_{up}"
-            if k not in result:
-                result.append(k)
-        elif len(part) == 1:
-            if f"KEY_{up}" in EVDEV_TO_LED:
-                k = f"KEY_{up}"
-                if k not in result:
-                    result.append(k)
+        elif f"KEY_{up}" in EVDEV_TO_LED and f"KEY_{up}" not in result:
+            result.append(f"KEY_{up}")
     return result
 
 
@@ -186,6 +177,13 @@ DEFAULT_CONFIG = {
     "fade_duration": 0.45,          # Duration of flash fade in seconds
     "custom_keys": {}               # { "KEY_ESC": {"color": [255, 0, 0], "brightness": 10}, ... }
 }
+
+
+CONFIG_POLL_INTERVAL = 0.2   # seconds between config reloads
+IDLE_TIMEOUT = 0.2           # select() timeout when no fade is running
+FADE_TIMEOUT = 0.01          # select() timeout while animating a fade
+MIN_RETRIGGER_DELAY = 0.08   # ignore a key re-firing within this delay
+HW_FULL_BRIGHTNESS = 50      # matrix mode drives brightness in software
 
 
 def is_inherit(val):
@@ -222,10 +220,10 @@ def resolve_brightness(raw, fallback):
 def resolve_key_settings(cfg, raw_bg, global_b):
     """Resolve the unattenuated color and brightness of every LED position.
 
-    This is the first rung of the inheritance chain: a custom key falls back
-    to the keyboard background color and/or brightness for each value it
-    leaves to `inherit`. Returns {pos: (raw_color, brightness)}, brightness
-    being on the 0-10 scale so that the flash can inherit it in turn.
+    First rung of the inheritance chain: a custom key falls back to the keyboard
+    background color and/or brightness for each value it leaves to `inherit`.
+    Brightness stays on the 0-10 scale rather than being pre-multiplied, so that
+    the flash can inherit it in turn. Returns {pos: (raw_color, brightness)}.
     """
     raw_bg = tuple(raw_bg)
     settings = {pos: (raw_bg, global_b) for pos in VALID_POSITIONS}
@@ -234,52 +232,93 @@ def resolve_key_settings(cfg, raw_bg, global_b):
         pos = EVDEV_TO_LED.get(kname)
         if pos not in settings:
             continue
-        raw_col = cinfo.get("color")
-        if is_inherit(raw_col):
-            col = raw_bg
-        else:
-            parsed = parse_color(raw_col, default=None)
-            col = tuple(parsed) if parsed is not None else raw_bg
-        settings[pos] = (col, resolve_brightness(cinfo.get("brightness"), global_b))
+        parsed = parse_color(cinfo.get("color"), default=None)
+        settings[pos] = (tuple(parsed) if parsed is not None else raw_bg,
+                         resolve_brightness(cinfo.get("brightness"), global_b))
     return settings
 
 
-def compute_key_base_colors(cfg, effective_bg, key_settings=None):
-    """Compute base (idle) color for each of the valid LED positions."""
-    if not cfg.get("backlight", True) or key_settings is None:
+def compute_key_base_colors(key_settings, effective_bg, backlight_on=True):
+    """Compute the resting color of every LED position."""
+    if not backlight_on:
         return {pos: tuple(effective_bg) for pos in VALID_POSITIONS}
     return {pos: scale_color(col, bri) for pos, (col, bri) in key_settings.items()}
 
 
-def compute_key_flash_colors(cfg, key_settings, base_map):
+def compute_key_flash_colors(key_settings, base_map, flash_color, flash_brightness):
     """Compute the peak flash color of every LED position.
 
-    Second rung of the inheritance chain: the flash falls back to each key's
-    own resolved color and/or brightness for the values left to `inherit` --
-    so a key already inheriting from the keyboard propagates that color all
-    the way to its flash. The peak is the key's base color blended toward the
-    flash color by the flash brightness, which keeps a non-inherited flash
-    behaving exactly as before.
+    Second rung of the inheritance chain: the flash falls back to each key's own
+    resolved color and/or brightness, so a key already inheriting from the
+    keyboard propagates that color all the way to its flash. The peak blends the
+    key's resting color toward the flash color by the flash brightness, which
+    leaves a non-inherited flash behaving exactly as it did before.
     """
-    raw_fc = cfg.get("flash_color", [255, 255, 255])
-    raw_fb = cfg.get("flash_brightness", 10)
-    fc_inherits = is_inherit(raw_fc)
-    fb_inherits = is_inherit(raw_fb)
-
-    flash_col = None
-    if not fc_inherits:
-        flash_col = parse_color(raw_fc, default=[255, 255, 255])
-        if flash_col is None:
-            flash_col = [255, 255, 255]
-    flash_bri = None if fb_inherits else resolve_brightness(raw_fb, 10)
+    inherit_color = is_inherit(flash_color)
+    inherit_brightness = is_inherit(flash_brightness)
+    target = None if inherit_color else parse_color(flash_color, default=[255, 255, 255])
+    factor = None if inherit_brightness else resolve_brightness(flash_brightness, 10) / 10.0
 
     peaks = {}
     for pos, (key_col, key_bri) in key_settings.items():
-        target = key_col if fc_inherits else flash_col
-        factor = (key_bri if fb_inherits else flash_bri) / 10.0
+        peak = key_col if inherit_color else target
+        f = key_bri / 10.0 if inherit_brightness else factor
         base = base_map.get(pos, (0, 0, 0))
-        peaks[pos] = tuple(int(b + (t - b) * factor) for b, t in zip(base, target))
+        peaks[pos] = tuple(int(b + (t - b) * f) for b, t in zip(base, peak))
     return peaks
+
+
+def first_lit_color(*candidates):
+    """First candidate parsing to a non-black color: the hue keys inherit from."""
+    for c in candidates:
+        col = parse_color(c, default=None)
+        if col and col != [0, 0, 0]:
+            return col
+    return list(DEFAULT_CONFIG["bg_color"])
+
+
+Lighting = namedtuple("Lighting", (
+    "backlight flash fade_duration brightness flash_brightness "
+    "raw_bg effective_bg hw_flash_color is_dark base_map flash_map state"
+))
+
+
+def resolve_lighting(cfg):
+    """Resolve a config into everything the render loop needs.
+
+    Pure function: the whole inheritance chain (keyboard -> custom key -> flash)
+    is settled here, so the daemon loop only has to render and send frames.
+    """
+    backlight = bool(cfg.get("backlight", True))
+    brightness = resolve_brightness(cfg.get("brightness"), 10)
+    raw_bg = first_lit_color(cfg.get("bg_color"), cfg.get("saved_color"))
+    effective_bg = [0, 0, 0] if (not backlight or brightness == 0) else list(scale_color(raw_bg, brightness))
+
+    flash_color = cfg.get("flash_color", [255, 255, 255])
+    flash_brightness = cfg.get("flash_brightness", 10)
+
+    key_settings = resolve_key_settings(cfg, raw_bg, brightness)
+    base_map = compute_key_base_colors(key_settings, effective_bg, backlight)
+
+    return Lighting(
+        backlight=backlight,
+        flash=bool(cfg.get("flash", True)),
+        fade_duration=float(cfg.get("fade_duration", 0.45)),
+        brightness=brightness,
+        # Global flash brightness, for the hardware mode and the on/off test;
+        # in matrix mode each key's own value is already baked into flash_map.
+        flash_brightness=resolve_brightness(flash_brightness, brightness),
+        raw_bg=raw_bg,
+        effective_bg=effective_bg,
+        # The hardware reactive mode is monochrome, so an inherited flash can
+        # only fall back to the background color there.
+        hw_flash_color=raw_bg if is_inherit(flash_color) else parse_color(flash_color, default=[255, 255, 255]),
+        # The hardware mode can render a dark keyboard, but not custom keys.
+        is_dark=(effective_bg == [0, 0, 0] and (not backlight or not cfg.get("custom_keys"))),
+        base_map=base_map,
+        flash_map=compute_key_flash_colors(key_settings, base_map, flash_color, flash_brightness),
+        state=json.dumps(cfg, sort_keys=True),
+    )
 
 
 def load_config():
@@ -287,14 +326,13 @@ def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r") as f:
-                cfg = json.load(f)
-                res = DEFAULT_CONFIG.copy()
-                res.update(cfg)
+                res = copy.deepcopy(DEFAULT_CONFIG)
+                res.update(json.load(f))
                 return res
         except Exception:
             pass
     save_config(DEFAULT_CONFIG)
-    return DEFAULT_CONFIG.copy()
+    return copy.deepcopy(DEFAULT_CONFIG)
 
 
 def save_config(cfg):
@@ -320,54 +358,54 @@ def get_theme_accent_color():
     return [0, 180, 216]
 
 
+# Color names accepted by parse_color, in French and English.
+NAMED_COLORS = {
+    "off": (0, 0, 0), "black": (0, 0, 0), "noir": (0, 0, 0),
+    "none": (0, 0, 0), "dark": (0, 0, 0), "0": (0, 0, 0),
+    "white": (255, 255, 255), "blanc": (255, 255, 255),
+    "red": (255, 0, 0), "rouge": (255, 0, 0),
+    "green": (0, 255, 0), "vert": (0, 255, 0),
+    "blue": (0, 120, 255), "bleu": (0, 120, 255),
+    "cyan": (0, 220, 255),
+    "orange": (255, 120, 0),
+    "yellow": (255, 200, 0), "jaune": (255, 200, 0),
+    "purple": (180, 0, 255), "violet": (180, 0, 255),
+    "magenta": (255, 0, 150), "rose": (255, 0, 150), "pink": (255, 0, 150),
+}
+
+
 def parse_color(c, default=None):
-    """Parse color string, array, or hex (with or without #)."""
+    """Parse a color name, "r,g,b" triplet, hex code (with or without #) or RGB list.
+
+    Returns None for values left to the inheritance chain, so callers must test
+    is_inherit() first to tell "inherit" apart from an unparsable color.
+    """
     if is_inherit(c):
         return None
     if isinstance(c, (list, tuple)) and len(c) == 3:
         return [max(0, min(255, int(x))) for x in c]
-    if isinstance(c, str):
-        c = c.lower().strip()
-        if c == "theme":
-            return get_theme_accent_color()
-        if c in ("off", "black", "noir", "none", "dark", "0"):
-            return [0, 0, 0]
-        if c in ("white", "blanc"):
-            return [255, 255, 255]
-        if c in ("red", "rouge"):
-            return [255, 0, 0]
-        if c in ("green", "vert"):
-            return [0, 255, 0]
-        if c in ("blue", "bleu"):
-            return [0, 120, 255]
-        if c == "cyan":
-            return [0, 220, 255]
-        if c == "orange":
-            return [255, 120, 0]
-        if c in ("yellow", "jaune"):
-            return [255, 200, 0]
-        if c in ("purple", "violet"):
-            return [180, 0, 255]
-        if c in ("magenta", "rose", "pink"):
-            return [255, 0, 150]
+    if not isinstance(c, str):
+        return default
 
-        if "," in c:
-            parts = c.split(",")
-            if len(parts) == 3:
-                try:
-                    return [max(0, min(255, int(p.strip()))) for p in parts]
-                except ValueError:
-                    pass
+    c = c.lower().strip()
+    if c == "theme":
+        return get_theme_accent_color()
+    if c in NAMED_COLORS:
+        return list(NAMED_COLORS[c])
 
-        # Hex support (#123456 or 123456 or #123 or 123)
-        clean = c.lstrip("#")
-        if len(clean) == 3 and all(ch in "0123456789abcdef" for ch in clean):
-            clean = "".join([ch * 2 for ch in clean])
-        if len(clean) == 6 and all(ch in "0123456789abcdef" for ch in clean):
+    if "," in c:
+        parts = c.split(",")
+        if len(parts) == 3:
             try:
-                return [int(clean[0:2], 16), int(clean[2:4], 16), int(clean[4:6], 16)]
+                return [max(0, min(255, int(p.strip()))) for p in parts]
             except ValueError:
                 pass
+
+    clean = c.lstrip("#")
+    if len(clean) == 3:
+        clean = "".join(ch * 2 for ch in clean)
+    if len(clean) == 6 and all(ch in "0123456789abcdef" for ch in clean):
+        return [int(clean[i:i + 2], 16) for i in (0, 2, 4)]
     return default
 
 
@@ -422,7 +460,8 @@ def get_keyboard_input_device():
 
 
 class KeyboardController:
-    """Controls Aorus keyboard RGB via USB HID."""
+    """Controls the Aorus keyboard RGB over USB HID."""
+
     def __init__(self):
         self.dev_path = get_keyboard_hid_path()
         self.handle = None
@@ -432,277 +471,187 @@ class KeyboardController:
 
     def connect(self):
         if self.handle:
-            try: self.handle.close()
-            except: pass
+            try:
+                self.handle.close()
+            except Exception:
+                pass
         self.handle = hid.device()
         self.handle.open_path(self.dev_path)
         self.current_mode = None
         self.current_hw_brightness = None
 
-    def ensure_connected(self):
+    @staticmethod
+    def _packet(*payload):
+        """Build a feature report: leading 0x00, 7 payload bytes, trailing checksum."""
+        return bytes([0x00, *payload, (0xFF - sum(payload)) & 0xFF])
+
+    def _send_feature(self, pkt):
+        """Send a feature report, reconnecting once if the handle went stale."""
         if not self.handle:
             self.connect()
+        try:
+            self.handle.send_feature_report(pkt)
+        except Exception:
+            self.connect()
+            self.handle.send_feature_report(pkt)
 
     def set_hardware_reactive(self, brightness_byte=50, color_code=0x07):
-        """Native hardware reactive (Mode 0x04, Color 0x01..0x07). Instant, 0 CPU."""
-        self.ensure_connected()
-        s = 0x08 + 0x00 + 0x04 + 0x01 + brightness_byte + color_code + 0x01
-        cs = (0xFF - s) & 0xFF
-        pkt = bytes([0x00, 0x08, 0x00, 0x04, 0x01, brightness_byte, color_code, 0x01, cs])
-        try:
-            self.handle.send_feature_report(pkt)
-            self.current_mode = "reactive"
-            self.current_hw_brightness = brightness_byte
-        except Exception:
-            self.connect()
-            self.handle.send_feature_report(pkt)
-            self.current_mode = "reactive"
-            self.current_hw_brightness = brightness_byte
+        """Native hardware reactive mode (0x04). Runs at 1000 Hz on the MCU, 0 CPU."""
+        self._send_feature(self._packet(0x08, 0x00, 0x04, 0x01, brightness_byte, color_code, 0x01))
+        self.current_mode = "reactive"
+        self.current_hw_brightness = brightness_byte
 
     def set_hardware_off(self):
-        """Turn off keyboard lights."""
-        self.ensure_connected()
-        s = 0x08 + 0x00 + 0x01 + 0x01 + 0x00 + 0x00 + 0x01
-        cs = (0xFF - s) & 0xFF
-        pkt = bytes([0x00, 0x08, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, cs])
-        try:
-            self.handle.send_feature_report(pkt)
-            self.current_mode = "off"
-            self.current_hw_brightness = 0
-        except Exception:
-            self.connect()
-            self.handle.send_feature_report(pkt)
-            self.current_mode = "off"
-            self.current_hw_brightness = 0
+        """Turn all keyboard lights off."""
+        self._send_feature(self._packet(0x08, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01))
+        self.current_mode = "off"
+        self.current_hw_brightness = 0
 
     def enter_custom_mode(self, hw_brightness=50):
-        """Send mode 0x33 packet once to enter custom per-key matrix mode."""
-        self.ensure_connected()
-        s = 0x08 + 0x00 + 0x33 + 0x01 + hw_brightness + 0x05 + 0x01
-        cs = (0xFF - s) & 0xFF
-        mode_pkt = bytes([0x00, 0x08, 0x00, 0x33, 0x01, hw_brightness, 0x05, 0x01, cs])
-        self.handle.send_feature_report(mode_pkt)
+        """Switch to per-key matrix mode (0x33).
+
+        Must be sent only on an actual mode change: re-sending it every frame
+        resets the MCU lighting engine and makes the keyboard stutter.
+        """
+        self._send_feature(self._packet(0x08, 0x00, 0x33, 0x01, hw_brightness, 0x05, 0x01))
         self.current_mode = "custom"
         self.current_hw_brightness = hw_brightness
 
-    def send_frame(self, key_rgb_dict, hw_brightness=50):
-        """Sends per-key custom frame directly to keyboard LED buffer via 0x12."""
-        self.ensure_connected()
+    def send_frame(self, key_rgb, hw_brightness=50):
+        """Send one per-key frame (report 0x12, 8 chunks of 64 bytes)."""
         if self.current_mode != "custom" or self.current_hw_brightness != hw_brightness:
-            try:
-                self.enter_custom_mode(hw_brightness)
-            except Exception:
-                self.connect()
-                self.enter_custom_mode(hw_brightness)
+            self.enter_custom_mode(hw_brightness)
 
         color_data = bytearray(512)
-        for pos, (r, g, b) in key_rgb_dict.items():
+        for pos, (r, g, b) in key_rgb.items():
             if pos in VALID_POSITIONS:
-                color_data[pos*4 + 1] = int(r)
-                color_data[pos*4 + 2] = int(g)
-                color_data[pos*4 + 3] = int(b)
+                color_data[pos * 4 + 1] = int(r)
+                color_data[pos * 4 + 2] = int(g)
+                color_data[pos * 4 + 3] = int(b)
 
-        pkt = bytes([0x00, 0x12, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0xE5])
+        header = bytes([0x00, 0x12, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0xE5])
 
-        def _do_send():
-            self.handle.send_feature_report(pkt)
+        def _write_frame():
+            self.handle.send_feature_report(header)
             for i in range(8):
-                chunk = bytes([0x00]) + color_data[64*i : 64*(i+1)]
-                self.handle.write(chunk)
-            self.current_mode = "custom"
-            self.current_hw_brightness = hw_brightness
+                self.handle.write(bytes([0x00]) + color_data[64 * i:64 * (i + 1)])
 
         try:
-            _do_send()
+            _write_frame()
         except Exception:
-            self.connect()
-            self.enter_custom_mode(hw_brightness)
             try:
-                _do_send()
+                self.connect()
+                self.enter_custom_mode(hw_brightness)
+                _write_frame()
             except Exception:
-                pass
+                return
+        self.current_mode = "custom"
+        self.current_hw_brightness = hw_brightness
+
+
+def drain_input(input_dev, timeout):
+    """Wait up to `timeout` for key events; return the LED positions just pressed."""
+    try:
+        ready, _, _ = select.select([input_dev], [], [], timeout)
+        if not ready:
+            return []
+        return [EVDEV_TO_LED[name]
+                for ev in input_dev.read()
+                if ev.type == evdev.ecodes.EV_KEY and ev.value == 1
+                for name in (evdev.ecodes.KEY.get(ev.code),)
+                if name in EVDEV_TO_LED]
+    except Exception:
+        return []
+
+
+def render_frame(lighting, active_fades, now):
+    """Build the frame for the running fades, dropping the ones that are over."""
+    frame = dict(lighting.base_map)
+    for pos, started in list(active_fades.items()):
+        elapsed = now - started
+        if elapsed >= lighting.fade_duration:
+            del active_fades[pos]
+            continue
+        ratio = elapsed / lighting.fade_duration
+        # Smoothstep easing: the USB endpoint caps us at ~10 FPS, and a linear
+        # fade is visibly stepped at that rate.
+        factor = 1.0 - (3.0 * ratio * ratio - 2.0 * ratio * ratio * ratio)
+        base = lighting.base_map.get(pos, (0, 0, 0))
+        peak = lighting.flash_map.get(pos, base)
+        frame[pos] = tuple(int(p * factor + b * (1.0 - factor)) for p, b in zip(peak, base))
+    return frame
 
 
 def run_daemon():
-    """Main daemon loop."""
+    """Main daemon loop: reload config, resolve lighting, render."""
     with open(PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
     def on_exit(signum, frame):
-        if os.path.exists(PID_FILE):
-            try: os.remove(PID_FILE)
-            except: pass
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
         sys.exit(0)
 
     signal.signal(signal.SIGINT, on_exit)
     signal.signal(signal.SIGTERM, on_exit)
-
-    def on_sigusr1(signum, frame):
-        pass
-    signal.signal(signal.SIGUSR1, on_sigusr1)
+    # SIGUSR1 from the CLI only needs to break the select() below.
+    signal.signal(signal.SIGUSR1, lambda signum, frame: None)
 
     controller = KeyboardController()
     input_dev = get_keyboard_input_device()
     fcntl.fcntl(input_dev.fd, fcntl.F_SETFL, os.O_NONBLOCK)
 
-    active_fades = {} # {led_pos: start_time}
-    last_applied_state = None
-    last_cfg_check = 0
+    active_fades = {}  # {led_pos: flash start time}
+    applied_state = None
+    cfg = load_config()
+    last_cfg_check = time.time()
 
     while True:
-        now = time.time()
-
-        if now - last_cfg_check > 0.2:
+        if time.time() - last_cfg_check > CONFIG_POLL_INTERVAL:
             cfg = load_config()
-            last_cfg_check = now
+            last_cfg_check = time.time()
 
-        backlight_on = cfg.get("backlight", True)
-        flash_enabled = cfg.get("flash", True)
-        b_val = max(0, min(10, int(cfg.get("brightness", 10))))
+        light = resolve_lighting(cfg)
+        flash_on = light.flash and light.flash_brightness > 0
+        changed = light.state != applied_state
 
-        # Global flash brightness. Only drives the hardware reactive mode and
-        # the on/off test: in matrix mode the flash brightness is resolved per
-        # key by compute_key_flash_colors(), which may inherit each key's own.
-        fb_val = resolve_brightness(cfg.get("flash_brightness", 10), b_val)
-
-        fade_duration = float(cfg.get("fade_duration", 0.45))
-
-        custom_keys = cfg.get("custom_keys", {})
-        has_custom_keys = bool(custom_keys)
-
-        # Raw background color (unscaled)
-        raw_bg = parse_color(cfg.get("bg_color", [0, 180, 216]), default=[0, 180, 216])
-        if raw_bg == [0, 0, 0]:
-            raw_bg = parse_color(cfg.get("saved_color", [0, 180, 216]), default=[0, 180, 216])
-            if raw_bg == [0, 0, 0]:
-                raw_bg = [0, 180, 216]
-
-        # Effective background color
-        if not backlight_on or b_val == 0:
-            effective_bg = [0, 0, 0]
-        else:
-            effective_bg = list(scale_color(raw_bg, b_val))
-
-        # Global flash color, used by the hardware reactive mode only: that
-        # mode has a single color for the whole keyboard, so an inherited
-        # flash falls back to the background (white if the background is off).
-        raw_flash_col = cfg.get("flash_color", [255, 255, 255])
-        if is_inherit(raw_flash_col):
-            flash_col = raw_bg if raw_bg != [0, 0, 0] else [255, 255, 255]
-        else:
-            flash_col = parse_color(raw_flash_col, default=[255, 255, 255])
-            if flash_col is None:
-                flash_col = raw_bg
-
-        # Dark hardware reactive mode is used ONLY if whole keyboard is dark AND (backlight is off OR no custom keys)
-        is_dark = (effective_bg == [0, 0, 0] and (not backlight_on or not has_custom_keys))
-
-        # Inheritance chain: keyboard -> custom key -> flash
-        key_settings = resolve_key_settings(cfg, raw_bg, b_val)
-        base_map = compute_key_base_colors(cfg, effective_bg, key_settings)
-        flash_map = compute_key_flash_colors(cfg, key_settings, base_map)
-        ck_hash = json.dumps(custom_keys, sort_keys=True)
-
-        current_state_key = (backlight_on, flash_enabled, b_val, fb_val, tuple(effective_bg),
-                             tuple(raw_bg), tuple(flash_col), ck_hash,
-                             json.dumps(cfg.get("flash_color"), sort_keys=True),
-                             json.dumps(cfg.get("flash_brightness"), sort_keys=True))
-
-        # --- CASE 1: Clavier éteint (fond noir sans touches personnalisées) ---
-        if is_dark:
-            hw_color = get_hw_color_code(flash_col)
-            use_hw_reactive = (flash_enabled and fb_val > 0)
-            hw_b = max(5, min(50, fb_val * 5))
-
-            if current_state_key != last_applied_state:
-                if use_hw_reactive:
-                    controller.set_hardware_reactive(brightness_byte=hw_b, color_code=hw_color)
-                elif not flash_enabled or fb_val == 0:
+        # Keyboard dark and no custom key: the MCU can do the whole effect
+        # itself, at 1000 Hz for 0% CPU and no USB traffic.
+        if light.is_dark:
+            if changed:
+                if flash_on:
+                    controller.set_hardware_reactive(
+                        brightness_byte=max(5, min(50, light.flash_brightness * 5)),
+                        color_code=get_hw_color_code(light.hw_flash_color))
+                else:
                     controller.set_hardware_off()
-                last_applied_state = current_state_key
+                applied_state = light.state
                 active_fades.clear()
-
-            if use_hw_reactive or not flash_enabled or fb_val == 0:
-                # Sleep waiting for input
-                try:
-                    r, _, _ = select.select([input_dev], [], [], 0.2)
-                    if r:
-                        for _ in input_dev.read(): pass
-                except Exception:
-                    pass
-                continue
-
-        # --- CASE 2: Clavier coloré ou touches personnalisées actives ---
-        hw_b = 50
-
-        if not flash_enabled or fb_val == 0:
-            if current_state_key != last_applied_state:
-                controller.send_frame(base_map, hw_brightness=hw_b)
-                last_applied_state = current_state_key
-                active_fades.clear()
-
-            try:
-                r, _, _ = select.select([input_dev], [], [], 0.2)
-                if r:
-                    for _ in input_dev.read(): pass
-            except Exception:
-                pass
+            drain_input(input_dev, IDLE_TIMEOUT)
             continue
 
-        # Active reactive flash mode on colored/custom background
-        if current_state_key != last_applied_state:
-            controller.send_frame(base_map, hw_brightness=hw_b)
-            last_applied_state = current_state_key
+        # Colored background or custom keys: we drive the matrix ourselves.
+        if changed:
+            controller.send_frame(light.base_map, hw_brightness=HW_FULL_BRIGHTNESS)
+            applied_state = light.state
             active_fades.clear()
 
-        # Listen for keystrokes
-        timeout = 0.01 if active_fades else 0.2
-        try:
-            r, _, _ = select.select([input_dev], [], [], timeout)
-        except Exception:
-            r = False
+        if not flash_on:
+            drain_input(input_dev, IDLE_TIMEOUT)
+            continue
 
-        if r:
-            try:
-                for ev in input_dev.read():
-                    if ev.type == evdev.ecodes.EV_KEY and ev.value == 1:
-                        kname = evdev.ecodes.KEY.get(ev.code)
-                        if kname and kname in EVDEV_TO_LED:
-                            pos = EVDEV_TO_LED[kname]
-                            now_ev = time.time()
-                            if pos not in active_fades or (now_ev - active_fades[pos]) > 0.08:
-                                active_fades[pos] = now_ev
-            except Exception:
-                pass
+        pressed = drain_input(input_dev, FADE_TIMEOUT if active_fades else IDLE_TIMEOUT)
+        now = time.time()
+        for pos in pressed:
+            # Ignore key repeat: restarting a fade that just began looks like a stutter.
+            if now - active_fades.get(pos, 0) > MIN_RETRIGGER_DELAY:
+                active_fades[pos] = now
 
-        # Update animation frame
         if active_fades:
-            cur_time = time.time()
-            frame_keys = {}
-            to_remove = []
-            for pos in VALID_POSITIONS:
-                base_col = base_map.get(pos, tuple(effective_bg))
-                if pos in active_fades:
-                    elapsed = cur_time - active_fades[pos]
-                    if elapsed >= fade_duration:
-                        to_remove.append(pos)
-                        frame_keys[pos] = base_col
-                    else:
-                        ratio = elapsed / fade_duration
-                        # Smoothstep easing for fluid LED fade without stepping
-                        factor = 1.0 - (3.0 * ratio * ratio - 2.0 * ratio * ratio * ratio)
-                        peak_col = flash_map.get(pos, base_col)
-                        r = int(peak_col[0] * factor + base_col[0] * (1.0 - factor))
-                        g = int(peak_col[1] * factor + base_col[1] * (1.0 - factor))
-                        b = int(peak_col[2] * factor + base_col[2] * (1.0 - factor))
-                        frame_keys[pos] = (r, g, b)
-                else:
-                    frame_keys[pos] = base_col
-
-            for p in to_remove:
-                del active_fades[p]
-
-            controller.send_frame(frame_keys, hw_brightness=hw_b)
+            controller.send_frame(render_frame(light, active_fades, time.time()),
+                                  hw_brightness=HW_FULL_BRIGHTNESS)
 
 
 if __name__ == "__main__":

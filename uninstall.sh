@@ -19,3 +19,6 @@ echo "Suppression des fichiers du démon..."
 rm -rf "$HOME/.local/share/aorus-rgb"
 
 echo "✓ Désinstallation terminée."
+echo ""
+echo "Vos réglages et presets sont conservés dans ~/.config/aorus-rgb."
+echo "Pour les supprimer aussi : rm -rf ~/.config/aorus-rgb"

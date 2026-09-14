@@ -1,26 +1,24 @@
 # ⌨️ Aorus RGB Keyboard Controller for Linux
 
-Contrôleur de rétroéclairage complet et effet réactif touche-par-touche pour ordinateurs portables **Gigabyte Aorus** (testé et optimisé sur **Aorus 17X**, contrôleur USB `0414:8007` sous Arch Linux / Omarchy).
+Contrôleur de rétroéclairage et effet réactif touche-par-touche pour ordinateurs portables **Gigabyte Aorus** (testé sur **Aorus 17X**, contrôleur USB `0414:8007`, sous Arch Linux / Omarchy).
 
 ---
 
 ## ✨ Fonctionnalités
 
-- 💡 **Rétroéclairage général** : Allumage/extinction, intensité réglable de 0 à 10.
-- 🎨 **Palette complète & Thème Omarchy** : Couleurs par nom (`cyan`, `purple`, `red`, `blue`, etc.), détection automatique du thème Omarchy (`theme`), ou codes hexadécimaux (`#00b4d8`, `00b4d8`).
-- ⚡ **Effet Flash Réactif** : Effet de flash à la frappe avec fondu progressif (*fade-out*) personnalisable (couleur et intensité sur 10 indépendantes).
-- 🚀 **Zéro latence & Zéro CPU en fond noir** : Bascule automatique sur le mode réactif matériel natif (Mode 0x04 à 1000 Hz, 0% CPU, 0 paquet USB) lorsque le fond du clavier est éteint.
-- 🌊 **Fondu fluide sans clignotement** : Interpolation *Smoothstep* conçue spécifiquement pour la bande passante USB du contrôleur (93 ms par trame), éliminant tout clignotement ou bégaiement.
-- 🧬 **Héritage en cascade (`inherit`)** : Trois étages — clavier → touche personnalisée → flash. Chaque niveau reprend la valeur du niveau au-dessus pour tout ce qu'on laisse en `inherit`, si bien qu'un flash hérité prend la couleur *de la touche frappée* et suit automatiquement les changements de couleur globale ou de thème.
-- 💾 **Presets** : Enregistrement, rechargement et suppression de configurations complètes (fond, flash, touches personnalisées) par un simple nom.
-- 🔄 **Rechargement instantané** : Communication inter-processus par signal (`SIGUSR1`) pour une mise à jour des paramètres en moins d'une milliseconde.
-- ⚙️ **Service Systemd Utilisateur** : Gestion propre en tâche de fond, démarrage automatique avec la session graphique.
+- 💡 **Rétroéclairage** : allumage, extinction, intensité de 0 à 10.
+- 🎨 **Couleurs** : par nom (`cyan`, `purple`, `red`…), par code hexadécimal (`#00b4d8`, `00b4d8`), ou `theme` pour suivre le thème Omarchy actif.
+- 🌈 **Coloration par touche** : couleur et intensité fixes sur les touches de votre choix, par-dessus la couleur globale.
+- ⚡ **Flash réactif** : la touche frappée s'illumine puis revient en fondu vers sa couleur de repos.
+- 🧬 **Héritage en cascade** : clavier → touche → flash. Ce qu'on laisse en `inherit` suit le niveau au-dessus, donc un flash hérité prend la couleur *de la touche frappée*.
+- 💾 **Presets** : configurations complètes enregistrées et rappelées par un nom.
+- 🚀 **Zéro CPU en fond noir** : bascule automatique sur le mode réactif matériel (1000 Hz, 0 % CPU, aucun paquet USB) quand le clavier est éteint.
+- 🌊 **Fondu sans clignotement** : interpolation *smoothstep* calibrée sur la bande passante du contrôleur (~93 ms par trame).
+- 🔄 **Rechargement instantané** : le démon recharge ses réglages en moins d'une milliseconde, sans redémarrage.
 
 ---
 
-## 📦 Installation rapide
-
-Clonez le dépôt et exécutez le script d'installation :
+## 📦 Installation
 
 ```bash
 git clone https://github.com/limax84/aorus-rgb.git
@@ -28,80 +26,60 @@ cd aorus-rgb
 ./install.sh
 ```
 
-Le script installe automatiquement :
-1. Les dépendances Python (`hidapi`, `evdev`).
-2. Les règles udev pour l'accès aux périphériques USB sans root.
-3. Le démon dans `~/.local/share/aorus-rgb/`.
-4. Les commandes `aorus-rgb` et `aorus` dans `~/.local/bin/`.
-5. Le service systemd utilisateur `aorus-rgb.service` et le démarre.
+Le script installe les dépendances Python (`hidapi`, `evdev`), la règle udev donnant accès au périphérique sans root, le démon, les commandes `aorus` et `aorus-rgb`, puis active le service systemd utilisateur.
+
+Désinstallation : `./uninstall.sh`.
 
 ---
 
 ## 🚀 Utilisation
 
-Les commandes peuvent être appelées indifféremment avec `aorus rgb <commande>` ou `aorus-rgb <commande>`.
+`aorus rgb <commande>` et `aorus-rgb <commande>` sont équivalents. Sans argument, la commande affiche l'état complet et la liste des commandes.
 
-### État du clavier
+### Rétroéclairage
+
 ```bash
-aorus rgb status
+aorus rgb status                  # État complet du clavier
+aorus rgb on | off | toggle       # Allume, éteint, alterne
+aorus rgb brightness 5            # Intensité 0 à 10
+aorus rgb color cyan              # Couleur globale : nom, #hex, ou "theme"
 ```
 
-### Rétroéclairage principal
-```bash
-aorus rgb on                      # Allume le clavier
-aorus rgb off                     # Éteint le clavier
-aorus rgb toggle                  # Alterne allumé / éteint
-aorus rgb brightness <0-10>       # Règle l'intensité (ex: aorus rgb brightness 5)
-aorus rgb color <couleur>         # Règle la couleur (ex: cyan, purple, theme, #ff8800, 00b4d8)
-```
+### Coloration par touche
 
-### Effet Réactif (Flash à la frappe)
-```bash
-aorus rgb flash on                # Active l'effet flash
-aorus rgb flash off               # Désactive l'effet flash
-aorus rgb flash toggle            # Alterne on / off
-aorus rgb flash brightness <0-10> # Intensité du flash (ex: aorus rgb flash brightness 10)
-aorus rgb flash color <couleur>   # Couleur du flash (ex: white, green, yellow, purple, #ffffff)
-
-# Héritage : le flash suit la couleur / l'intensité de la touche frappée
-aorus rgb flash color inherit     # Chaque touche flashe vers SA propre couleur
-aorus rgb flash brightness inherit # Chaque touche flashe à SA propre intensité
-aorus rgb flash inherit           # Raccourci : couleur ET intensité héritées
-```
-
-### Coloration par touche (Per-Key RGB fixe)
-Permet d'assigner une couleur et une intensité fixes à des touches spécifiques en superposition de la couleur globale :
+Assigne une couleur et une intensité fixes à certaines touches, par-dessus la couleur globale.
 
 ```bash
-# Couleur et luminosité combinées (<couleur>:<luminosité> ou <couleur> <luminosité>)
 aorus rgb key super,ctrl,alt,shift red:10
 aorus rgb key echap,return,suppre,backspace cyan:8
-aorus rgb key wasd yellow 10
-aorus rgb key fleches orange:9
+aorus rgb key wasd yellow 10        # <couleur> <luminosité> équivaut à <couleur>:<luminosité>
 
 # Groupes prédéfinis
 aorus rgb key modifiers red:10      # super, ctrl, alt, shift
 aorus rgb key nav cyan:8            # debut, fin, pageup, pagedown, suppr, retour
 aorus rgb key fkeys blue:6          # f1 à f12
-aorus rgb key numpad purple:7       # pavé numérique complet
+aorus rgb key numpad purple:7       # pavé numérique
 aorus rgb key digits green:10       # chiffres 0 à 9
 
-# Réinitialiser des touches (retour à la couleur globale)
-aorus rgb key wasd reset
-aorus rgb key super,ctrl reset
-
-# Lister ou tout réinitialiser
-aorus rgb key list                  # Affiche les touches personnalisées actives
-aorus rgb key clear                 # Efface toutes les personnalisations par touche
+aorus rgb key wasd reset            # Retour à la couleur globale
+aorus rgb key list                  # Touches personnalisées actives
+aorus rgb key clear                 # Efface toutes les personnalisations
 ```
 
-> **Aliases disponibles (français & anglais)** : `super`, `win`, `ctrl`, `alt`, `shift`, `maj`, `echap`, `escape`, `return`, `entree`, `suppre`, `suppr`, `delete`, `backspace`, `retour`, `tab`, `space`, `espace`, `fleches`, `arrows`, `haut`, `bas`, `gauche`, `droite`, `wasd`, `zqsd`, `fkeys`, `modifiers`, `nav`, `numpad`, `digits`...
+> **Aliases (français & anglais)** : `super`, `win`, `ctrl`, `alt`, `shift`, `maj`, `echap`, `escape`, `return`, `entree`, `suppre`, `suppr`, `delete`, `backspace`, `retour`, `tab`, `space`, `espace`, `fleches`, `arrows`, `haut`, `bas`, `gauche`, `droite`, `wasd`, `zqsd`, `fkeys`, `modifiers`, `nav`, `numpad`, `digits`…
+
+### Flash à la frappe
+
+```bash
+aorus rgb flash on | off | toggle
+aorus rgb flash brightness 10     # Intensité 0 à 10, ou "inherit"
+aorus rgb flash color white       # Couleur, ou "inherit"
+aorus rgb flash inherit           # Raccourci : couleur ET intensité héritées
+```
 
 ### Héritage en cascade (`inherit`)
 
-Partout où une couleur ou une intensité est attendue, la valeur spéciale `inherit` reprend le réglage du niveau au-dessus au lieu de le figer. Synonymes acceptés : `inherit`, `auto`, `null`, ou une valeur vide.
-
-La cascade compte trois étages :
+Partout où une couleur ou une intensité est attendue, `inherit` reprend le réglage du niveau au-dessus au lieu de le figer. Synonymes : `auto`, `null`, ou une valeur vide.
 
 ```
 clavier (bg_color + brightness)
@@ -109,67 +87,48 @@ clavier (bg_color + brightness)
           └─> flash (flash_color + flash_brightness)
 ```
 
-Une touche laissée en `inherit` prend la couleur du clavier ; un flash laissé en `inherit` prend la couleur de **la touche frappée** — laquelle peut elle-même l'avoir héritée du clavier. Concrètement, avec `aorus rgb flash color inherit` sur un clavier cyan où Échap est rouge : Échap flashe vers le rouge, et toutes les touches non personnalisées flashent vers le cyan.
-
 ```bash
-aorus rgb key wasd red:10           # Rouge fixe, intensité 10
-aorus rgb key wasd red:inherit      # Rouge, intensité héritée du clavier
-aorus rgb key wasd red:             # Raccourci pour red:inherit
-aorus rgb key wasd inherit:10       # Couleur héritée du clavier, intensité 10
-aorus rgb key wasd :10              # Raccourci pour inherit:10
-aorus rgb key wasd inherit          # Couleur ET intensité héritées
+aorus rgb key wasd red:10         # Rouge, intensité 10 : rien n'est hérité
+aorus rgb key wasd red:           # Rouge, intensité héritée du clavier
+aorus rgb key wasd :10            # Couleur héritée du clavier, intensité 10
+aorus rgb key wasd inherit        # Couleur et intensité héritées
 ```
 
-Concrètement, `aorus rgb key fkeys inherit:10` met les touches F1–F12 dans la teinte du clavier mais à pleine intensité : elles ressortent sans être d'une autre couleur, et elles suivront le prochain `aorus rgb color`.
+Sur un clavier cyan où Échap est rouge, `aorus rgb flash color inherit` fait flasher Échap vers le rouge et toutes les touches non personnalisées vers le cyan. De même, `aorus rgb key fkeys inherit:10` met F1–F12 dans la teinte du clavier mais à pleine intensité : elles ressortent sans changer de couleur, et suivront le prochain `aorus rgb color`.
 
-> **À noter** : `flash brightness inherit` fait flasher chaque touche à sa propre intensité de repos. L'effet est alors subtil, et nul pour une touche déjà à 10/10 (elle est déjà au maximum de sa couleur). Pour un flash hérité bien visible, combinez `flash color inherit` avec `flash brightness 10`.
-
-> **À noter** : `none` reste le synonyme de *noir* (`aorus rgb color none` éteint le fond) et n'est donc pas une valeur d'héritage.
+> **À noter** : `flash brightness inherit` fait flasher chaque touche à sa propre intensité de repos — donc sans effet visible sur une touche déjà à 10/10. Pour un flash hérité bien visible, combinez `flash color inherit` et `flash brightness 10`.
+>
+> `none` reste un synonyme de *noir* (`aorus rgb color none` éteint le fond) et n'est donc pas une valeur d'héritage.
 
 ### Presets
 
-Un preset enregistre la configuration complète : fond, intensité, flash, durée de fondu et toutes les touches personnalisées. Les fichiers sont stockés dans `~/.config/aorus-rgb/presets/<nom>.json`.
+Un preset enregistre la configuration complète — fond, intensité, flash, durée de fondu et toutes les touches personnalisées — dans `~/.config/aorus-rgb/presets/<nom>.json`.
 
 ```bash
-aorus rgb preset save gaming       # Enregistre la configuration active sous "gaming"
-aorus rgb preset load gaming       # Recharge et applique le preset
-aorus rgb gaming                   # Raccourci équivalent à "preset load gaming"
-aorus rgb preset list              # Liste les presets avec leur date et leur contenu
-aorus rgb preset delete gaming     # Supprime le preset
+aorus rgb preset save gaming      # Enregistre la configuration active
+aorus rgb preset load gaming      # Recharge et applique
+aorus rgb gaming                  # Raccourci équivalent
+aorus rgb preset list             # Presets disponibles, avec leur contenu
+aorus rgb preset delete gaming
 ```
 
-### Gestion du service
+### Service
+
 ```bash
-aorus rgb restart                 # Redémarre le démon en tâche de fond
+aorus rgb restart
 systemctl --user status aorus-rgb.service
 ```
 
 ---
 
-## 🛠️ Architecture & Protocole USB
+## 🛠️ Fonctionnement
 
-Le contrôleur USB Gigabyte `0414:8007` expose plusieurs interfaces :
-- **Interface 0** : Événements clavier Boot (`/dev/input/by-id/usb-GIGABYTE_USB-HID_Keyboard_AP0000000003-event-kbd`).
-- **Interface 3** : Contrôleur LED USB HID (`hidraw3`, Endpoint 0x06 OUT).
+Le démon lit `~/.config/aorus-rgb/config.json`, résout la cascade d'héritage, et pilote le contrôleur LED (interface USB HID 3) selon deux modes : le mode matériel `0x04`, monochrome mais gratuit en CPU, quand le clavier est noir sans touche personnalisée ; le mode matrice `0x33`/`0x12` sinon, qui transmet les 128 positions de LED par trame.
 
-### Modes d'éclairage
-1. **Mode Matériel 0x04 (Reactive)** : Utilisé quand le fond est noir. Le microcontrôleur gère nativement l'effet à 1000 Hz pour 7 couleurs prédéfinies.
-2. **Mode Matrice 0x33 & 0x12** : Utilisé pour le rétroéclairage couleur et les animations personnalisées.
-   - Le paquet de mode `0x33` bascule le contrôleur en mode matrice.
-   - Les trames sont transmises via le rapport `0x12` découpé en 8 blocs de 64 octets (512 octets au total pour 128 positions de touches).
-
-Pour plus de détails techniques, consultez [AGENTS.md](AGENTS.md).
-
----
-
-## 🗑️ Désinstallation
-
-```bash
-./uninstall.sh
-```
+Le protocole USB, le mapping des touches et les règles d'héritage sont documentés en détail dans [AGENTS.md](AGENTS.md).
 
 ---
 
 ## 📄 Licence
 
-MIT License - voir le fichier LICENSE pour plus de détails.
+MIT — voir [LICENSE](LICENSE).

@@ -42,7 +42,7 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 - **Envoi des couleurs de touches (Rapport 0x12)** :
   1. Envoi d'un Feature Report d'en-tête :
      `[0x00, 0x12, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0xE5]`
-  2. Envoi de 8 blocs consécutifs de 64 octets (512 octets au total) via `hid_write()` sur l'Endpoint `0x06` OUT.
+  2. Envoi de 8 blocs consécutifs de 64 octets (512 octets au total) via `handle.write()` (hidapi) sur l'Endpoint `0x06` OUT.
   3. Chaque touche occupe 4 octets à la position `pos * 4` :
      - `pos*4 + 0` : `0x00`
      - `pos*4 + 1` : Composante Rouge (0..255)
@@ -60,69 +60,79 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 
 ---
 
-## 3. Communication Inter-Processus (CLI & Démon)
+## 3. Carte du code
 
-- **Fichier de configuration** : `~/.config/aorus-rgb/config.json`
-- **Presets** : `~/.config/aorus-rgb/presets/<nom>.json` (un fichier par preset, écrits et lus uniquement par la CLI ; le démon ne les connaît pas).
-- **PID du démon** : `~/.config/aorus-rgb/daemon.pid`
-- **Signal de mise à jour** : La commande CLI `aorus rgb` modifie le JSON puis envoie un signal `SIGUSR1` au PID du démon.
-- Le démon intercepte `SIGUSR1`, débloque instantanément son appel `select()` et applique la nouvelle configuration en moins de 1 ms sans redémarrer le service.
-- **Import des sources** : `bin/aorus-rgb` insère `LOCAL_SRC` puis `REPO_SRC` dans `sys.path` via `insert(0, …)`, dans cet ordre, pour que **le repo prime** sur la copie installée dans `~/.local/share/aorus-rgb`. Inverser cette boucle fait silencieusement exécuter l'ancienne version installée lors des tests depuis le repo.
+| Fichier | Rôle |
+|---|---|
+| `src/aorus_rgb.py` | Démon **et** bibliothèque partagée : mapping des touches, parsing des couleurs, résolution de l'héritage, `KeyboardController` (USB HID), boucle de rendu. |
+| `bin/aorus-rgb` | CLI. N'écrit que la config, ne parle jamais au périphérique. Importe tout le reste de `aorus_rgb`. |
+| `bin/aorus` | Dispatcher : `aorus rgb …` → `aorus-rgb …`. |
+| `install.sh` / `uninstall.sh` | Dépendances, règle udev, copie vers `~/.local/{bin,share}`, service systemd. |
+
+Règles de découpage à respecter :
+- **Une seule source de vérité pour la config** : `CONFIG_DIR`, `DEFAULT_CONFIG`, `load_config()` et `save_config()` vivent dans `src/aorus_rgb.py`. La CLI les importe — ne pas les redéfinir.
+- **`bin/aorus-rgb` insère `LOCAL_SRC` puis `REPO_SRC` dans `sys.path`** via `insert(0, …)`, dans cet ordre, pour que le repo prime sur la copie installée dans `~/.local/share/aorus-rgb`. Inverser cette boucle fait silencieusement exécuter l'ancienne version installée lors des tests depuis les sources.
+- Côté CLI, `apply(changes, message)` est le seul chemin d'écriture (sauvegarde, signale le démon, affiche l'état) et `fmt_color()` / `fmt_brightness()` les seuls formateurs d'affichage (ils gèrent `inherit`).
+
+### Communication CLI ↔ démon
+
+- **Configuration** : `~/.config/aorus-rgb/config.json`, relue toutes les `CONFIG_POLL_INTERVAL` secondes.
+- **Presets** : `~/.config/aorus-rgb/presets/<nom>.json`, écrits et lus uniquement par la CLI ; le démon ne les connaît pas.
+- **PID du démon** : `~/.config/aorus-rgb/daemon.pid`.
+- La CLI écrit le JSON puis envoie `SIGUSR1` au démon, ce qui débloque son `select()` : la nouvelle configuration s'applique en moins d'une milliseconde, sans redémarrer le service.
 
 ---
 
-## 4. Layout, Mapping et Coloration par Touche (Per-Key)
+## 4. Layout, mapping et coloration par touche
 
-- Le dictionnaire `EVDEV_TO_LED` dans `src/aorus_rgb.py` mappe les codes evdev Linux (ex: `KEY_SPACE`) vers les positions de LED internes Gigabyte (ex: `42`).
-- Le dictionnaire `KEY_ALIASES` et la fonction `resolve_keys()` résolvent les noms usuels français et anglais (avec ou sans accents) vers les identifiants evdev :
-  - Modificateurs : `super`, `win`, `ctrl`, `alt`, `shift`, `maj`, `caps`, `fn`...
-  - Navigation/édition : `echap`, `escape`, `return`, `entree`, `suppre`, `suppr`, `delete`, `backspace`, `retour`...
-  - Direction : `fleches`, `arrows`, `haut`, `bas`, `gauche`, `droite`...
-  - Groupes : `wasd`, `zqsd`, `fkeys`, `modifiers`, `nav`, `numpad`, `digits`...
-- **Format de configuration `custom_keys`** :
+- `EVDEV_TO_LED` mappe les codes evdev (`KEY_SPACE`) vers les positions de LED Gigabyte (`42`). `VALID_POSITIONS` en est l'ensemble trié.
+- `KEY_ALIASES` et `resolve_keys()` résolvent les noms usuels français et anglais, avec ou sans accents : modificateurs (`super`, `ctrl`, `maj`…), navigation (`echap`, `entree`, `suppre`…), directions (`fleches`, `haut`…) et groupes (`wasd`, `zqsd`, `fkeys`, `modifiers`, `nav`, `numpad`, `digits`, `all`).
+- Format de `custom_keys` dans la config :
   ```json
   "custom_keys": {
     "KEY_ESC": {"color": [255, 0, 0], "brightness": 10},
-    "KEY_LEFTMETA": {"color": [0, 220, 255], "brightness": 8},
-    "KEY_W": {"color": "inherit", "brightness": 10},
-    "KEY_F1": {"color": [255, 0, 0], "brightness": "inherit"}
+    "KEY_W":   {"color": "inherit",   "brightness": 10},
+    "KEY_F1":  {"color": [255, 0, 0], "brightness": "inherit"}
   }
   ```
-- **Héritage en cascade (`inherit`)** :
-  - Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau reprend la valeur du niveau au-dessus pour chaque champ laissé en `inherit`.
-  - `is_inherit(val)` (dans `src/aorus_rgb.py`) est le point de vérité unique : renvoie `True` pour `None` et pour les chaînes `inherit`, `auto`, `clavier`, `kbl`, `null`, `default` et la chaîne vide.
-  - **`none` est volontairement exclu** de cette liste : c'est l'alias historique de *noir* dans `parse_color()` (`aorus rgb color none` éteint le fond). Ne pas le réintroduire dans `is_inherit()` sans traiter la régression sur `cmd_color`.
-  - `parse_color()` renvoie `None` pour toute valeur d'héritage ; les appelants doivent donc distinguer « couleur invalide » et « héritage » via `is_inherit()` **avant** d'appeler `parse_color()`.
-  - **Pipeline de résolution** (dans `run_daemon`, à chaque rechargement de config) :
-    1. `resolve_key_settings(cfg, raw_bg, b_val)` → `{pos: (raw_color, brightness)}`. Étage 1 : chaque touche personnalisée retombe sur `raw_bg` (couleur de fond **non atténuée**) et/ou `b_val` (intensité globale). La brillance est conservée sur l'échelle 0-10, non pré-multipliée, précisément pour que le flash puisse en hériter ensuite.
-    2. `compute_key_base_colors(cfg, effective_bg, key_settings)` → couleurs de repos (`raw_color × brightness/10` via `scale_color`).
-    3. `compute_key_flash_colors(cfg, key_settings, base_map)` → couleur de **pic** du flash, par position. Étage 2 : un `flash_color` hérité prend `raw_color` de la touche, un `flash_brightness` hérité prend sa `brightness`. Le pic est `base + (cible - base) × facteur`, ce qui reproduit à l'identique l'ancien comportement quand le flash n'hérite de rien.
-  - Le flash est donc résolu **par touche**, pas globalement. Les variables `flash_col` / `fb_val` globales qui subsistent dans `run_daemon` ne servent plus qu'au **mode matériel 0x04** (monochrome par construction) et au test d'activation du flash.
-  - Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque touche à sa propre intensité de repos — effet nul pour une touche déjà à 10/10. Le réglage utile est `flash_color: "inherit"` + `flash_brightness: 10`.
-  - Côté CLI, `fmt_color()` et `fmt_brightness()` sont les helpers d'affichage à réutiliser (ils gèrent le cas `inherit`) ; ne pas réécrire de formatage inline.
-
-- **Rendu & Flash réactif** :
-  - `compute_key_base_colors(cfg, effective_bg, key_settings)` calcule la couleur de repos de chaque LED, `compute_key_flash_colors()` la couleur de pic du flash.
-  - En mode matrice personnalisée, la luminosité matérielle (`hw_b`) reste calée à 50 (pleine échelle), et chaque touche est modulée directement en valeur RGB logicielle.
-  - Lorsqu'une touche est pressée, elle flashe vers son pic (`flash_map[pos]`, pré-calculé) puis revient en fondu progressif vers sa couleur de repos.
 
 ---
 
-## 5. Commandes CLI
+## 5. Héritage en cascade (`inherit`)
 
-Le binaire `aorus-rgb` (et son alias `aorus rgb`) supporte :
-- `aorus rgb on` / `aorus rgb off` / `aorus rgb toggle`
-- `aorus rgb brightness <0-10>`
-- `aorus rgb color <couleur>` (nom usuel, `theme`, ou code `#hex` / `hex`)
-- `aorus rgb flash on` / `aorus rgb flash off` / `aorus rgb flash toggle`
-- `aorus rgb flash brightness <0-10|inherit>`
-- `aorus rgb flash color <couleur|inherit>`
-- `aorus rgb flash inherit` (couleur + luminosité héritées)
-- `aorus rgb key <touches> <couleur[:luminosité]> [luminosité]` — chaque partie accepte `inherit` ; `red:`, `:10` et `inherit` seul sont des raccourcis.
-- `aorus rgb key <touches> reset`
-- `aorus rgb key list`
-- `aorus rgb key clear`
-- `aorus rgb preset save|load|list|delete <nom>`
-- `aorus rgb <nom-de-preset>` (raccourci de `preset load`)
-- `aorus rgb status`
-- `aorus rgb restart`
+Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau reprend la valeur du niveau au-dessus pour chaque champ laissé en `inherit`.
+
+- `is_inherit(val)` est le point de vérité unique : `True` pour `None` et pour les chaînes `inherit`, `auto`, `clavier`, `kbl`, `null`, `default` et la chaîne vide.
+- **`none` en est volontairement exclu** : c'est l'alias historique de *noir* dans `NAMED_COLORS` (`aorus rgb color none` éteint le fond). Ne pas le réintroduire dans `is_inherit()` sans traiter la régression sur `cmd_color`.
+- `parse_color()` renvoie `None` pour toute valeur d'héritage, donc un appelant doit distinguer « couleur invalide » de « héritage » en testant `is_inherit()` **avant**.
+
+### Pipeline de résolution
+
+`resolve_lighting(cfg)` est une fonction pure qui produit un `Lighting` : tout est résolu là, et la boucle du démon n'a plus qu'à rendre et envoyer des trames. Elle enchaîne :
+
+1. `resolve_key_settings(cfg, raw_bg, global_b)` → `{pos: (raw_color, brightness)}`. **Étage 1** : chaque touche personnalisée retombe sur `raw_bg` (couleur de fond non atténuée) et/ou sur l'intensité globale. La brillance reste sur l'échelle 0-10, non pré-multipliée, précisément pour que le flash puisse en hériter ensuite.
+2. `compute_key_base_colors(key_settings, effective_bg, backlight_on)` → couleurs de repos (`raw_color × brightness/10`, via `scale_color`).
+3. `compute_key_flash_colors(key_settings, base_map, flash_color, flash_brightness)` → couleur de **pic** du flash, par position. **Étage 2** : un `flash_color` hérité prend la `raw_color` de la touche, un `flash_brightness` hérité prend sa `brightness`. Le pic vaut `base + (cible − base) × facteur`, ce qui reproduit à l'identique le comportement d'un flash qui n'hérite de rien.
+
+Le flash est donc résolu **par touche**, jamais globalement. Les champs `Lighting.hw_flash_color` et `Lighting.flash_brightness` ne servent qu'au mode matériel `0x04`, monochrome par construction, et au test d'activation du flash.
+
+`Lighting.state` est la sérialisation JSON de la config : la boucle ne réémet une trame que lorsque cette chaîne change.
+
+Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque touche à sa propre intensité de repos — sans effet visible sur une touche déjà à 10/10. Le réglage utile est `flash_color: "inherit"` avec `flash_brightness: 10`.
+
+---
+
+## 6. Boucle de rendu
+
+- `run_daemon()` recharge la config, appelle `resolve_lighting()`, puis choisit son mode :
+  - **Mode matériel `0x04`** si `Lighting.is_dark` (fond noir *et* aucune touche personnalisée) : le MCU fait tout, 0 % CPU.
+  - **Mode matrice** sinon : `hw_brightness` reste calé à `HW_FULL_BRIGHTNESS` (50) et chaque touche est modulée en RGB logiciel.
+- `drain_input()` attend les frappes et renvoie les positions LED pressées ; `MIN_RETRIGGER_DELAY` filtre la répétition clavier, qui donnerait un flash saccadé.
+- `render_frame()` compose la trame des fondus en cours et retire ceux qui sont terminés.
+- Les constantes de la boucle (`CONFIG_POLL_INTERVAL`, `IDLE_TIMEOUT`, `FADE_TIMEOUT`, `MIN_RETRIGGER_DELAY`, `HW_FULL_BRIGHTNESS`) sont regroupées en tête de `src/aorus_rgb.py`.
+
+---
+
+## 7. Commandes CLI
+
+`aorus rgb` sans argument affiche l'état complet et la liste à jour des commandes ; le README en donne les exemples. Ne pas recopier cette liste ici, elle se périmerait.
