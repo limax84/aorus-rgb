@@ -1,0 +1,4 @@
+# Gigabyte Aorus Keyboard Controller permissions (0414:8007, 0414:8010, etc.)
+KERNEL=="hidraw*", ATTRS{idVendor}=="0414", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0414", MODE="0666"
+KERNEL=="event*", ATTRS{idVendor}=="0414", MODE="0666"

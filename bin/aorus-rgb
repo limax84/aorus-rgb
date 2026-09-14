@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""
+CLI pour le rétroéclairage et les effets du clavier Aorus.
+
+Commandes :
+  aorus rgb on                      - Allume le rétroéclairage
+  aorus rgb off                     - Éteint le rétroéclairage
+  aorus rgb toggle                  - Alterne rétroéclairage on / off
+  aorus rgb brightness <0-10>       - Règle l'intensité du rétroéclairage (sur 10)
+  aorus rgb flash on                - Active l'effet de touche blanche
+  aorus rgb flash off               - Désactive l'effet de touche blanche
+  aorus rgb flash toggle            - Alterne l'effet flash on / off
+  aorus rgb flash brightness <0-10> - Règle l'intensité du flash (sur 10)
+  aorus rgb flash color <couleur>   - Règle la couleur du flash (white, yellow, cyan, #hex...)
+  aorus rgb color <couleur>         - Règle la couleur du clavier (black, theme, red, 028391, #hex...)
+  aorus rgb status                  - Affiche l'état complet
+  aorus rgb restart                 - Redémarre le service
+"""
+
+import os
+import sys
+import json
+import time
+import subprocess
+import signal
+
+CONFIG_DIR = os.path.expanduser("~/.config/aorus-rgb")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+PID_FILE = os.path.join(CONFIG_DIR, "daemon.pid")
+
+DEFAULT_CONFIG = {
+    "backlight": True,
+    "flash": True,
+    "bg_color": [0, 180, 216],
+    "saved_color": [0, 180, 216],
+    "brightness": 10,
+    "flash_brightness": 10,
+    "flash_color": [255, 255, 255],
+    "fade_duration": 0.45
+}
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                cfg = json.load(f)
+                res = DEFAULT_CONFIG.copy()
+                res.update(cfg)
+                return res
+        except Exception:
+            pass
+    return DEFAULT_CONFIG.copy()
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+def is_service_active():
+    try:
+        res = subprocess.run(["systemctl", "--user", "is-active", "aorus-rgb.service"],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return res.stdout.strip() == "active"
+    except Exception:
+        return False
+
+def ensure_service_running():
+    if not is_service_active():
+        subprocess.run(["systemctl", "--user", "start", "aorus-rgb.service"])
+
+def notify_daemon():
+    ensure_service_running()
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, signal.SIGUSR1)
+        except Exception:
+            pass
+
+def restart_service():
+    subprocess.run(["systemctl", "--user", "restart", "aorus-rgb.service"])
+
+def cmd_status():
+    cfg = load_config()
+    svc_active = is_service_active()
+    bl_on = cfg.get("backlight", True)
+    flash_on = cfg.get("flash", True)
+    b_val = cfg.get("brightness", 10)
+    fb_val = cfg.get("flash_brightness", 10)
+    bg = cfg.get("bg_color", [0, 180, 216])
+    fl_col = cfg.get("flash_color", [255, 255, 255])
+    is_dark = (bg == [0, 0, 0] or not bl_on or b_val == 0)
+
+    bl_str = f"\033[1;32mALLUMÉ ({b_val}/10)\033[0m" if (bl_on and b_val > 0) else "\033[1;30mÉTEINT\033[0m"
+    flash_str = f"\033[1;32mACTIVÉ ({fb_val}/10, couleur: {fl_col})\033[0m" if (flash_on and fb_val > 0) else "\033[1;31mDÉSACTIVÉ\033[0m"
+    svc_str = "\033[1;32mActif\033[0m" if svc_active else "\033[1;31mInactif\033[0m"
+
+    if is_dark:
+        mode_desc = "Clavier éteint (fond noir)"
+        if flash_on and fb_val > 0:
+            mode_desc += f" + Flash réactif {fl_col} ({fb_val}/10)"
+        else:
+            mode_desc += " (aucun effet)"
+    else:
+        mode_desc = f"Clavier coloré {bg} ({b_val}/10)"
+        if flash_on and fb_val > 0:
+            mode_desc += f" + Flash réactif {fl_col} ({fb_val}/10)"
+        else:
+            mode_desc += " (statique)"
+
+    print("════════════════════════════════════════════════════════════")
+    print(f" Rétroéclairage : {bl_str}")
+    print(f" Effet Flash    : {flash_str}")
+    print(f" Couleur active : {bg if bl_on else '[0, 0, 0] (éteint)'}")
+    print(f" Mode détecté   : {mode_desc}")
+    print(f" Service systemd: {svc_str}")
+    print("════════════════════════════════════════════════════════════")
+
+def cmd_on():
+    cfg = load_config()
+    cfg["backlight"] = True
+    if cfg.get("brightness", 10) == 0:
+        cfg["brightness"] = 10
+    if cfg.get("bg_color") == [0, 0, 0]:
+        saved = cfg.get("saved_color", [0, 180, 216])
+        if saved == [0, 0, 0]:
+            from aorus_rgb import get_theme_accent_color
+            saved = get_theme_accent_color()
+        cfg["bg_color"] = saved
+    save_config(cfg)
+    notify_daemon()
+    print("✓ Rétroéclairage clavier ALLUMÉ.")
+    cmd_status()
+
+def cmd_off():
+    cfg = load_config()
+    cfg["backlight"] = False
+    save_config(cfg)
+    notify_daemon()
+    print("✓ Rétroéclairage clavier ÉTEINT.")
+    cmd_status()
+
+def cmd_toggle():
+    cfg = load_config()
+    if cfg.get("backlight", True) and cfg.get("brightness", 10) > 0:
+        cmd_off()
+    else:
+        cmd_on()
+
+def cmd_brightness(val_str):
+    try:
+        val = int(val_str)
+        if not (0 <= val <= 10): raise ValueError()
+    except Exception:
+        print("Erreur: L'intensité du rétroéclairage doit être comprise entre 0 et 10.")
+        return
+    cfg = load_config()
+    cfg["brightness"] = val
+    if val > 0:
+        cfg["backlight"] = True
+    save_config(cfg)
+    notify_daemon()
+    print(f"✓ Intensité du rétroéclairage réglée à {val}/10.")
+    cmd_status()
+
+def cmd_flash_brightness(val_str):
+    try:
+        val = int(val_str)
+        if not (0 <= val <= 10): raise ValueError()
+    except Exception:
+        print("Erreur: L'intensité du flash doit être comprise entre 0 et 10.")
+        return
+    cfg = load_config()
+    cfg["flash_brightness"] = val
+    if val > 0:
+        cfg["flash"] = True
+    save_config(cfg)
+    notify_daemon()
+    print(f"✓ Intensité du flash réglée à {val}/10.")
+    cmd_status()
+
+def cmd_flash_color(color_str):
+    from aorus_rgb import parse_color
+    col = parse_color(color_str)
+    if col is None:
+        print(f"Erreur: Couleur '{color_str}' non reconnue.")
+        print("Exemples: white, yellow, cyan, red, 028391, '#ffffff'")
+        return
+    cfg = load_config()
+    cfg["flash_color"] = col
+    cfg["flash"] = True
+    save_config(cfg)
+    notify_daemon()
+    print(f"✓ Couleur du flash réglée sur {col}.")
+    cmd_status()
+
+def cmd_flash(args):
+    if not args:
+        # Toggle
+        cfg = load_config()
+        cfg["flash"] = not cfg.get("flash", True)
+        save_config(cfg)
+        notify_daemon()
+        state = "ACTIVÉ" if cfg["flash"] else "DÉSACTIVÉ"
+        print(f"✓ Effet flash {state}.")
+        cmd_status()
+        return
+
+    sub = args[0].lower().strip()
+    if sub == "on":
+        cfg = load_config()
+        cfg["flash"] = True
+        save_config(cfg)
+        notify_daemon()
+        print("✓ Effet flash ACTIVÉ.")
+        cmd_status()
+    elif sub == "off":
+        cfg = load_config()
+        cfg["flash"] = False
+        save_config(cfg)
+        notify_daemon()
+        print("✓ Effet flash DÉSACTIVÉ.")
+        cmd_status()
+    elif sub in ("brightness", "intensity"):
+        if len(args) > 1:
+            cmd_flash_brightness(args[1])
+        else:
+            print("Usage: aorus rgb flash brightness <0-10>")
+    elif sub == "color":
+        if len(args) > 1:
+            cmd_flash_color(args[1])
+        else:
+            print("Usage: aorus rgb flash color <white|yellow|cyan|028391|#hex>")
+            print("Astuce: en terminal, passez les codes hex sans '#' (ex: ffffff) ou entre guillemets (ex: \"#ffffff\").")
+    else:
+        # Check if argument is a number (e.g. `aorus rgb flash 8`)
+        try:
+            val = int(sub)
+            if 0 <= val <= 10:
+                cmd_flash_brightness(sub)
+                return
+        except ValueError:
+            pass
+        # Check if argument is a color directly
+        from aorus_rgb import parse_color
+        try:
+            col = parse_color(sub)
+            if col is not None:
+                cmd_flash_color(sub)
+                return
+        except Exception:
+            pass
+        print(f"Sous-commande flash inconnue: {sub}")
+
+def cmd_color(color_str):
+    cfg = load_config()
+    from aorus_rgb import parse_color
+    rgb = parse_color(color_str)
+    if rgb is None:
+        print(f"Erreur: Couleur '{color_str}' non reconnue.")
+        print("Exemples: theme, black, red, green, blue, cyan, orange, yellow, purple, 028391, '#028391'")
+        return
+    cfg["bg_color"] = rgb
+    if rgb != [0, 0, 0]:
+        cfg["saved_color"] = rgb
+        cfg["backlight"] = True
+    else:
+        cfg["backlight"] = False
+    save_config(cfg)
+    notify_daemon()
+    if rgb == [0, 0, 0]:
+        print("✓ Couleur réglée sur NOIR (fond éteint détecté).")
+    else:
+        print(f"✓ Couleur réglée sur {rgb} (fond coloré détecté).")
+    cmd_status()
+
+def main():
+    sys.path.insert(0, os.path.expanduser("~/.local/share/aorus-rgb"))
+
+    args = sys.argv[1:]
+    # Support "aorus rgb ..." syntax
+    if args and args[0].lower() == "rgb":
+        args = args[1:]
+
+    if not args:
+        cmd_status()
+        print("\nCommandes disponibles :")
+        print("  aorus rgb on                      - Allume le rétroéclairage")
+        print("  aorus rgb off                     - Éteint le rétroéclairage")
+        print("  aorus rgb toggle                  - Alterne rétroéclairage on / off")
+        print("  aorus rgb brightness <0-10>       - Règle l'intensité du clavier (0-10)")
+        print("  aorus rgb flash on                - Active le flash à la frappe")
+        print("  aorus rgb flash off               - Désactive le flash à la frappe")
+        print("  aorus rgb flash brightness <0-10> - Règle l'intensité du flash (0-10)")
+        print("  aorus rgb flash color <couleur>   - Règle la couleur du flash")
+        print("  aorus rgb color <couleur>         - Règle la couleur de fond (theme, red, 028391...)")
+        print("  aorus rgb status                  - Affiche l'état")
+        print("  aorus rgb restart                 - Redémarre le service")
+        return
+
+    sub = args[0].lower()
+    if sub == "on":
+        cmd_on()
+    elif sub == "off":
+        cmd_off()
+    elif sub == "toggle":
+        cmd_toggle()
+    elif sub in ("brightness", "intensity"):
+        if len(args) > 1:
+            cmd_brightness(args[1])
+        else:
+            print("Usage: aorus rgb brightness <0-10>")
+    elif sub == "flash":
+        cmd_flash(args[1:])
+    elif sub == "color":
+        if len(args) > 1:
+            cmd_color(args[1])
+        else:
+            print("Usage: aorus rgb color <theme|black|red|cyan|blue|028391|#hex>")
+            print("Astuce: en terminal, passez les codes hex sans '#' (ex: 028391) ou entre guillemets (ex: \"#028391\").")
+    elif sub == "status":
+        cmd_status()
+    elif sub == "restart":
+        restart_service()
+        cmd_status()
+    else:
+        # Check if argument is a direct color or hex
+        from aorus_rgb import parse_color
+        try:
+            rgb = parse_color(sub)
+            if rgb is not None:
+                cmd_color(sub)
+                return
+        except Exception:
+            pass
+        print(f"Commande inconnue: {sub}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

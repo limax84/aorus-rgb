@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Wrapper allowing "aorus rgb ..." commands to invoke "aorus-rgb"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -x "$SCRIPT_DIR/aorus-rgb" ]; then
+    exec "$SCRIPT_DIR/aorus-rgb" "$@"
+else
+    exec aorus-rgb "$@"
+fi
