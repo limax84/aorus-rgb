@@ -11,6 +11,8 @@ Contrôleur de rétroéclairage complet et effet réactif touche-par-touche pour
 - ⚡ **Effet Flash Réactif** : Effet de flash à la frappe avec fondu progressif (*fade-out*) personnalisable (couleur et intensité sur 10 indépendantes).
 - 🚀 **Zéro latence & Zéro CPU en fond noir** : Bascule automatique sur le mode réactif matériel natif (Mode 0x04 à 1000 Hz, 0% CPU, 0 paquet USB) lorsque le fond du clavier est éteint.
 - 🌊 **Fondu fluide sans clignotement** : Interpolation *Smoothstep* conçue spécifiquement pour la bande passante USB du contrôleur (93 ms par trame), éliminant tout clignotement ou bégaiement.
+- 🧬 **Héritage dynamique (`inherit`)** : Le flash et les touches personnalisées peuvent hériter de la couleur et/ou de l'intensité du clavier ; elles suivent alors automatiquement tout changement de couleur globale ou de thème.
+- 💾 **Presets** : Enregistrement, rechargement et suppression de configurations complètes (fond, flash, touches personnalisées) par un simple nom.
 - 🔄 **Rechargement instantané** : Communication inter-processus par signal (`SIGUSR1`) pour une mise à jour des paramètres en moins d'une milliseconde.
 - ⚙️ **Service Systemd Utilisateur** : Gestion propre en tâche de fond, démarrage automatique avec la session graphique.
 
@@ -60,6 +62,11 @@ aorus rgb flash off               # Désactive l'effet flash
 aorus rgb flash toggle            # Alterne on / off
 aorus rgb flash brightness <0-10> # Intensité du flash (ex: aorus rgb flash brightness 10)
 aorus rgb flash color <couleur>   # Couleur du flash (ex: white, green, yellow, purple, #ffffff)
+
+# Héritage : le flash suit la couleur / l'intensité du clavier
+aorus rgb flash color inherit     # Le flash prend la couleur globale du clavier
+aorus rgb flash brightness inherit # Le flash prend l'intensité globale du clavier
+aorus rgb flash inherit           # Raccourci : couleur ET intensité héritées
 ```
 
 ### Coloration par touche (Per-Key RGB fixe)
@@ -89,6 +96,35 @@ aorus rgb key clear                 # Efface toutes les personnalisations par to
 ```
 
 > **Aliases disponibles (français & anglais)** : `super`, `win`, `ctrl`, `alt`, `shift`, `maj`, `echap`, `escape`, `return`, `entree`, `suppre`, `suppr`, `delete`, `backspace`, `retour`, `tab`, `space`, `espace`, `fleches`, `arrows`, `haut`, `bas`, `gauche`, `droite`, `wasd`, `zqsd`, `fkeys`, `modifiers`, `nav`, `numpad`, `digits`...
+
+### Héritage dynamique (`inherit`)
+
+Partout où une couleur ou une intensité est attendue, la valeur spéciale `inherit` fait suivre le réglage du clavier au lieu de le figer. Synonymes acceptés : `inherit`, `auto`, `null`, ou une valeur vide.
+
+```bash
+aorus rgb key wasd red:10           # Rouge fixe, intensité 10
+aorus rgb key wasd red:inherit      # Rouge, intensité héritée du clavier
+aorus rgb key wasd red:             # Raccourci pour red:inherit
+aorus rgb key wasd inherit:10       # Couleur héritée du clavier, intensité 10
+aorus rgb key wasd :10              # Raccourci pour inherit:10
+aorus rgb key wasd inherit          # Couleur ET intensité héritées
+```
+
+Concrètement, `aorus rgb key fkeys inherit:10` met les touches F1–F12 dans la teinte du clavier mais à pleine intensité : elles ressortent sans être d'une autre couleur, et elles suivront le prochain `aorus rgb color`.
+
+> **À noter** : `none` reste le synonyme de *noir* (`aorus rgb color none` éteint le fond) et n'est donc pas une valeur d'héritage.
+
+### Presets
+
+Un preset enregistre la configuration complète : fond, intensité, flash, durée de fondu et toutes les touches personnalisées. Les fichiers sont stockés dans `~/.config/aorus-rgb/presets/<nom>.json`.
+
+```bash
+aorus rgb preset save gaming       # Enregistre la configuration active sous "gaming"
+aorus rgb preset load gaming       # Recharge et applique le preset
+aorus rgb gaming                   # Raccourci équivalent à "preset load gaming"
+aorus rgb preset list              # Liste les presets avec leur date et leur contenu
+aorus rgb preset delete gaming     # Supprime le preset
+```
 
 ### Gestion du service
 ```bash

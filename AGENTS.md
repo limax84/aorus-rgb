@@ -63,9 +63,11 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 ## 3. Communication Inter-Processus (CLI & Démon)
 
 - **Fichier de configuration** : `~/.config/aorus-rgb/config.json`
+- **Presets** : `~/.config/aorus-rgb/presets/<nom>.json` (un fichier par preset, écrits et lus uniquement par la CLI ; le démon ne les connaît pas).
 - **PID du démon** : `~/.config/aorus-rgb/daemon.pid`
 - **Signal de mise à jour** : La commande CLI `aorus rgb` modifie le JSON puis envoie un signal `SIGUSR1` au PID du démon.
 - Le démon intercepte `SIGUSR1`, débloque instantanément son appel `select()` et applique la nouvelle configuration en moins de 1 ms sans redémarrer le service.
+- **Import des sources** : `bin/aorus-rgb` insère `LOCAL_SRC` puis `REPO_SRC` dans `sys.path` via `insert(0, …)`, dans cet ordre, pour que **le repo prime** sur la copie installée dans `~/.local/share/aorus-rgb`. Inverser cette boucle fait silencieusement exécuter l'ancienne version installée lors des tests depuis le repo.
 
 ---
 
@@ -81,11 +83,22 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
   ```json
   "custom_keys": {
     "KEY_ESC": {"color": [255, 0, 0], "brightness": 10},
-    "KEY_LEFTMETA": {"color": [0, 220, 255], "brightness": 8}
+    "KEY_LEFTMETA": {"color": [0, 220, 255], "brightness": 8},
+    "KEY_W": {"color": "inherit", "brightness": 10},
+    "KEY_F1": {"color": [255, 0, 0], "brightness": "inherit"}
   }
   ```
+- **Héritage dynamique (`inherit`)** :
+  - `is_inherit(val)` (dans `src/aorus_rgb.py`) est le point de vérité unique : renvoie `True` pour `None` et pour les chaînes `inherit`, `auto`, `clavier`, `kbl`, `null`, `default` et la chaîne vide.
+  - **`none` est volontairement exclu** de cette liste : c'est l'alias historique de *noir* dans `parse_color()` (`aorus rgb color none` éteint le fond). Ne pas le réintroduire dans `is_inherit()` sans traiter la régression sur `cmd_color`.
+  - `parse_color()` renvoie `None` pour toute valeur d'héritage ; les appelants doivent donc distinguer « couleur invalide » et « héritage » via `is_inherit()` **avant** d'appeler `parse_color()`.
+  - S'applique à `flash_color`, `flash_brightness` et à chaque entrée de `custom_keys`.
+  - Résolution côté démon (`run_daemon`) : `raw_bg` est la couleur de fond **non atténuée**, `b_val` l'intensité globale. Une couleur héritée reçoit `raw_bg` ; une intensité héritée reçoit `b_val`. `compute_key_base_colors(cfg, effective_bg, raw_bg, global_b)` reçoit ces deux valeurs en paramètres.
+  - Conséquence utile : `color: "inherit"` + `brightness: 10` donne la teinte du clavier à pleine intensité — la touche ressort sans changer de teinte et suit les changements de `bg_color`.
+  - Côté CLI, `fmt_color()` et `fmt_brightness()` sont les helpers d'affichage à réutiliser (ils gèrent le cas `inherit`) ; ne pas réécrire de formatage inline.
+
 - **Rendu & Flash réactif** :
-  - `compute_key_base_colors(cfg, effective_bg)` calcule la couleur de repos de chaque LED.
+  - `compute_key_base_colors(cfg, effective_bg, raw_bg, global_b)` calcule la couleur de repos de chaque LED.
   - En mode matrice personnalisée, la luminosité matérielle (`hw_b`) reste calée à 50 (pleine échelle), et chaque touche est modulée directement en valeur RGB logicielle.
   - Lorsqu'une touche personnalisée est pressée, elle flashe selon `flash_color` et revient en fondu progressif vers sa couleur personnalisée spécifique.
 
@@ -98,11 +111,14 @@ Le binaire `aorus-rgb` (et son alias `aorus rgb`) supporte :
 - `aorus rgb brightness <0-10>`
 - `aorus rgb color <couleur>` (nom usuel, `theme`, ou code `#hex` / `hex`)
 - `aorus rgb flash on` / `aorus rgb flash off` / `aorus rgb flash toggle`
-- `aorus rgb flash brightness <0-10>`
-- `aorus rgb flash color <couleur>`
-- `aorus rgb key <touches> <couleur[:luminosité]> [luminosité]`
+- `aorus rgb flash brightness <0-10|inherit>`
+- `aorus rgb flash color <couleur|inherit>`
+- `aorus rgb flash inherit` (couleur + luminosité héritées)
+- `aorus rgb key <touches> <couleur[:luminosité]> [luminosité]` — chaque partie accepte `inherit` ; `red:`, `:10` et `inherit` seul sont des raccourcis.
 - `aorus rgb key <touches> reset`
 - `aorus rgb key list`
 - `aorus rgb key clear`
+- `aorus rgb preset save|load|list|delete <nom>`
+- `aorus rgb <nom-de-preset>` (raccourci de `preset load`)
 - `aorus rgb status`
 - `aorus rgb restart`

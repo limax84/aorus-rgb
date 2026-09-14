@@ -188,18 +188,48 @@ DEFAULT_CONFIG = {
 }
 
 
-def compute_key_base_colors(cfg, effective_bg):
+def is_inherit(val):
+    """Check if a color or brightness value is set to inherit from keyboard background."""
+    if val is None:
+        return True
+    if isinstance(val, str):
+        v = val.lower().strip()
+        # "none" is deliberately absent: it is the historical alias for black.
+        return v in ("inherit", "auto", "clavier", "kbl", "null", "default", "")
+    return False
+
+
+def compute_key_base_colors(cfg, effective_bg, raw_bg=None, global_b=10):
     """Compute base (idle) color for each of the valid LED positions."""
     custom_keys = cfg.get("custom_keys", {})
     backlight_on = cfg.get("backlight", True)
     base_map = {pos: tuple(effective_bg) for pos in VALID_POSITIONS}
     if not backlight_on:
         return base_map
+    if raw_bg is None:
+        raw_bg = effective_bg
+
     for kname, cinfo in custom_keys.items():
         if kname in EVDEV_TO_LED:
             pos = EVDEV_TO_LED[kname]
-            col = parse_color(cinfo.get("color", [255, 255, 255]), default=[255, 255, 255])
-            br = max(0, min(10, int(cinfo.get("brightness", 10)))) / 10.0
+            raw_col = cinfo.get("color")
+            if is_inherit(raw_col):
+                col = raw_bg
+            else:
+                col = parse_color(raw_col, default=[255, 255, 255])
+                if col is None:
+                    col = raw_bg
+
+            raw_bri = cinfo.get("brightness")
+            if is_inherit(raw_bri):
+                br_val = global_b
+            else:
+                try:
+                    br_val = max(0, min(10, int(raw_bri)))
+                except (ValueError, TypeError):
+                    br_val = global_b
+
+            br = br_val / 10.0
             base_map[pos] = (int(col[0] * br), int(col[1] * br), int(col[2] * br))
     return base_map
 
@@ -244,6 +274,8 @@ def get_theme_accent_color():
 
 def parse_color(c, default=None):
     """Parse color string, array, or hex (with or without #)."""
+    if is_inherit(c):
+        return None
     if isinstance(c, (list, tuple)) and len(c) == 3:
         return [max(0, min(255, int(x))) for x in c]
     if isinstance(c, str):
@@ -479,33 +511,53 @@ def run_daemon():
         backlight_on = cfg.get("backlight", True)
         flash_enabled = cfg.get("flash", True)
         b_val = max(0, min(10, int(cfg.get("brightness", 10))))
-        fb_val = max(0, min(10, int(cfg.get("flash_brightness", 10))))
-        flash_col = parse_color(cfg.get("flash_color", [255, 255, 255]), default=[255, 255, 255])
+
+        # Flash brightness resolution
+        raw_fb = cfg.get("flash_brightness", 10)
+        if is_inherit(raw_fb):
+            fb_val = b_val
+        else:
+            try:
+                fb_val = max(0, min(10, int(raw_fb)))
+            except (ValueError, TypeError):
+                fb_val = 10
+
         fade_duration = float(cfg.get("fade_duration", 0.45))
 
         custom_keys = cfg.get("custom_keys", {})
         has_custom_keys = bool(custom_keys)
 
-        # Determine effective background color
+        # Raw background color (unscaled)
+        raw_bg = parse_color(cfg.get("bg_color", [0, 180, 216]), default=[0, 180, 216])
+        if raw_bg == [0, 0, 0]:
+            raw_bg = parse_color(cfg.get("saved_color", [0, 180, 216]), default=[0, 180, 216])
+            if raw_bg == [0, 0, 0]:
+                raw_bg = [0, 180, 216]
+
+        # Effective background color
         if not backlight_on or b_val == 0:
             effective_bg = [0, 0, 0]
         else:
-            raw_bg = parse_color(cfg.get("bg_color", [0, 180, 216]), default=[0, 180, 216])
-            if raw_bg == [0, 0, 0]:
-                raw_bg = parse_color(cfg.get("saved_color", [0, 180, 216]), default=[0, 180, 216])
-                if raw_bg == [0, 0, 0]:
-                    raw_bg = [0, 180, 216]
             b_factor = b_val / 10.0
             effective_bg = [int(c * b_factor) for c in raw_bg]
+
+        # Flash color resolution
+        raw_flash_col = cfg.get("flash_color", [255, 255, 255])
+        if is_inherit(raw_flash_col):
+            flash_col = raw_bg if raw_bg != [0, 0, 0] else [255, 255, 255]
+        else:
+            flash_col = parse_color(raw_flash_col, default=[255, 255, 255])
+            if flash_col is None:
+                flash_col = raw_bg
 
         # Dark hardware reactive mode is used ONLY if whole keyboard is dark AND (backlight is off OR no custom keys)
         is_dark = (effective_bg == [0, 0, 0] and (not backlight_on or not has_custom_keys))
 
         # Compute per-key base colors
-        base_map = compute_key_base_colors(cfg, effective_bg)
+        base_map = compute_key_base_colors(cfg, effective_bg, raw_bg=raw_bg, global_b=b_val)
         ck_hash = json.dumps(custom_keys, sort_keys=True)
 
-        current_state_key = (backlight_on, flash_enabled, b_val, fb_val, tuple(effective_bg), tuple(flash_col), ck_hash)
+        current_state_key = (backlight_on, flash_enabled, b_val, fb_val, tuple(effective_bg), tuple(raw_bg), tuple(flash_col), ck_hash)
 
         # --- CASE 1: Clavier éteint (fond noir sans touches personnalisées) ---
         if is_dark:

@@ -10,13 +10,17 @@ Commandes :
   aorus rgb flash on                - Active l'effet de touche à la frappe
   aorus rgb flash off               - Désactive l'effet de touche à la frappe
   aorus rgb flash toggle            - Alterne l'effet flash on / off
-  aorus rgb flash brightness <0-10> - Règle l'intensité du flash (sur 10)
-  aorus rgb flash color <couleur>   - Règle la couleur du flash (white, yellow, cyan, #hex...)
-  aorus rgb color <couleur>         - Règle la couleur globale (black, theme, red, 028391, #hex...)
-  aorus rgb key <touches> <c[:b]>   - Colorie des touches fixes (ex: super,ctrl,alt red:10)
+  aorus rgb flash brightness <b|inherit> - Intensité du flash (0-10 ou inherit)
+  aorus rgb flash color <c|inherit> - Couleur du flash (white, red, inherit...)
+  aorus rgb color <couleur>         - Règle la couleur globale (black, theme, red, #hex...)
+  aorus rgb key <touches> <c[:b]>   - Colorie des touches (supporte valeurs 'inherit')
   aorus rgb key <touches> reset     - Réinitialise des touches vers la couleur globale
   aorus rgb key list                - Liste les touches personnalisées actives
   aorus rgb key clear               - Réinitialise toutes les touches personnalisées
+  aorus rgb preset save <nom>       - Enregistre la configuration active en preset
+  aorus rgb preset load <nom>       - Charge et applique un preset
+  aorus rgb preset list             - Liste les presets disponibles
+  aorus rgb preset delete <nom>     - Supprime un preset
   aorus rgb status                  - Affiche l'état complet
   aorus rgb restart                 - Redémarre le service
 """
@@ -25,20 +29,28 @@ import os
 import sys
 import json
 import time
+import glob
+import re
 import subprocess
 import signal
 
-# Add library paths (Dev repo first if running from source, then local install)
+# Add library paths. Inserted in reverse order so that REPO_SRC ends up first
+# in sys.path: running from the Dev repo must use the repo sources, not the
+# copy installed in ~/.local/share.
 REPO_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 LOCAL_SRC = os.path.expanduser("~/.local/share/aorus-rgb")
-for p in [REPO_SRC, LOCAL_SRC]:
+for p in [LOCAL_SRC, REPO_SRC]:
     if os.path.exists(p) and p not in sys.path:
         sys.path.insert(0, p)
 
-from aorus_rgb import parse_color, resolve_keys, get_theme_accent_color, KEY_ALIASES, EVDEV_TO_LED
+from aorus_rgb import (
+    parse_color, resolve_keys, get_theme_accent_color,
+    KEY_ALIASES, EVDEV_TO_LED, is_inherit
+)
 
 CONFIG_DIR = os.path.expanduser("~/.config/aorus-rgb")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+PRESETS_DIR = os.path.join(CONFIG_DIR, "presets")
 PID_FILE = os.path.join(CONFIG_DIR, "daemon.pid")
 
 DEFAULT_CONFIG = {
@@ -52,6 +64,20 @@ DEFAULT_CONFIG = {
     "fade_duration": 0.45,
     "custom_keys": {}
 }
+
+def fmt_color(val):
+    """Format a color value for display ('inherit' or [r, g, b])."""
+    if is_inherit(val):
+        return "inherit"
+    if isinstance(val, (list, tuple)):
+        return str(list(val))
+    return str(val)
+
+def fmt_brightness(val):
+    """Format a brightness value for display ('inherit' or 'n/10')."""
+    if is_inherit(val):
+        return "inherit"
+    return f"{val}/10"
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -108,25 +134,28 @@ def cmd_status():
     is_dark = (bg == [0, 0, 0] or not bl_on or b_val == 0)
 
     bl_str = f"\033[1;32mALLUMÉ ({b_val}/10)\033[0m" if (bl_on and b_val > 0) else "\033[1;30mÉTEINT\033[0m"
-    flash_str = f"\033[1;32mACTIVÉ ({fb_val}/10, couleur: {fl_col})\033[0m" if (flash_on and fb_val > 0) else "\033[1;31mDÉSACTIVÉ\033[0m"
+
+    fl_col_str = fmt_color(fl_col)
+    fb_val_str = fmt_brightness(fb_val)
+    flash_str = f"\033[1;32mACTIVÉ ({fb_val_str}, couleur: {fl_col_str})\033[0m" if (flash_on and fb_val != 0) else "\033[1;31mDÉSACTIVÉ\033[0m"
     svc_str = "\033[1;32mActif\033[0m" if svc_active else "\033[1;31mInactif\033[0m"
 
     if is_dark and not custom_keys:
         mode_desc = "Clavier éteint (fond noir)"
-        if flash_on and fb_val > 0:
-            mode_desc += f" + Flash réactif {fl_col} ({fb_val}/10)"
+        if flash_on and fb_val != 0:
+            mode_desc += f" + Flash réactif {fl_col_str} ({fb_val_str})"
         else:
             mode_desc += " (aucun effet)"
     elif is_dark and custom_keys:
         mode_desc = f"Fond éteint + {len(custom_keys)} touche(s) personnalisée(s)"
-        if flash_on and fb_val > 0:
-            mode_desc += f" + Flash {fl_col} ({fb_val}/10)"
+        if flash_on and fb_val != 0:
+            mode_desc += f" + Flash {fl_col_str} ({fb_val_str})"
     else:
         mode_desc = f"Clavier coloré {bg} ({b_val}/10)"
         if custom_keys:
             mode_desc += f" + {len(custom_keys)} touche(s) persos"
-        if flash_on and fb_val > 0:
-            mode_desc += f" + Flash réactif {fl_col} ({fb_val}/10)"
+        if flash_on and fb_val != 0:
+            mode_desc += f" + Flash réactif {fl_col_str} ({fb_val_str})"
         else:
             mode_desc += " (statique)"
 
@@ -141,11 +170,11 @@ def cmd_status():
         print(" ────────────────────────────────────────────────────────────")
         groups = {}
         for kname, cinfo in sorted(custom_keys.items()):
-            col = tuple(cinfo.get("color", [255, 255, 255]))
-            bri = cinfo.get("brightness", 10)
-            groups.setdefault((col, bri), []).append(kname)
-        for (col, bri), keys in groups.items():
-            print(f"  • {list(col)} ({bri}/10) : {', '.join(keys)}")
+            col_str = fmt_color(cinfo.get("color", [255, 255, 255]))
+            bri_str = fmt_brightness(cinfo.get("brightness", 10))
+            groups.setdefault((col_str, bri_str), []).append(kname)
+        for (col_str, bri_str), keys in groups.items():
+            print(f"  • {col_str} ({bri_str}) : {', '.join(keys)}")
     print("════════════════════════════════════════════════════════════")
 
 def cmd_on():
@@ -195,33 +224,43 @@ def cmd_brightness(val_str):
     cmd_status()
 
 def cmd_flash_brightness(val_str):
-    try:
-        val = int(val_str)
-        if not (0 <= val <= 10): raise ValueError()
-    except Exception:
-        print("Erreur: L'intensité du flash doit être comprise entre 0 et 10.")
-        return
+    if is_inherit(val_str):
+        val = "inherit"
+        desc = "INHERIT (hérite de l'intensité du clavier)"
+    else:
+        try:
+            val = int(val_str)
+            if not (0 <= val <= 10): raise ValueError()
+            desc = f"{val}/10"
+        except Exception:
+            print("Erreur: L'intensité du flash doit être comprise entre 0 et 10, ou 'inherit'.")
+            return
     cfg = load_config()
     cfg["flash_brightness"] = val
-    if val > 0:
+    if val != 0:
         cfg["flash"] = True
     save_config(cfg)
     notify_daemon()
-    print(f"✓ Intensité du flash réglée à {val}/10.")
+    print(f"✓ Intensité du flash réglée sur {desc}.")
     cmd_status()
 
 def cmd_flash_color(color_str):
-    col = parse_color(color_str)
-    if col is None:
-        print(f"Erreur: Couleur '{color_str}' non reconnue.")
-        print("Exemples: white, yellow, cyan, red, 028391, '#ffffff'")
-        return
+    if is_inherit(color_str):
+        col = "inherit"
+        desc = "INHERIT (hérite de la couleur du clavier)"
+    else:
+        col = parse_color(color_str)
+        if col is None:
+            print(f"Erreur: Couleur '{color_str}' non reconnue.")
+            print("Exemples: inherit, white, yellow, cyan, red, 028391, '#ffffff'")
+            return
+        desc = str(col)
     cfg = load_config()
     cfg["flash_color"] = col
     cfg["flash"] = True
     save_config(cfg)
     notify_daemon()
-    print(f"✓ Couleur du flash réglée sur {col}.")
+    print(f"✓ Couleur du flash réglée sur {desc}.")
     cmd_status()
 
 def cmd_flash(args):
@@ -251,16 +290,25 @@ def cmd_flash(args):
         notify_daemon()
         print("✓ Effet flash DÉSACTIVÉ.")
         cmd_status()
+    elif is_inherit(sub):
+        cfg = load_config()
+        cfg["flash_color"] = "inherit"
+        cfg["flash_brightness"] = "inherit"
+        cfg["flash"] = True
+        save_config(cfg)
+        notify_daemon()
+        print("✓ Effet flash réglé sur INHERIT (couleur et luminosité héritées du clavier).")
+        cmd_status()
     elif sub in ("brightness", "intensity"):
         if len(args) > 1:
             cmd_flash_brightness(args[1])
         else:
-            print("Usage: aorus rgb flash brightness <0-10>")
+            print("Usage: aorus rgb flash brightness <0-10|inherit>")
     elif sub == "color":
         if len(args) > 1:
             cmd_flash_color(args[1])
         else:
-            print("Usage: aorus rgb flash color <white|yellow|cyan|028391|#hex>")
+            print("Usage: aorus rgb flash color <inherit|white|yellow|cyan|028391|#hex>")
             print("Astuce: en terminal, passez les codes hex sans '#' (ex: ffffff) ou entre guillemets (ex: \"#ffffff\").")
     else:
         # Check if argument is a number (e.g. `aorus rgb flash 8`)
@@ -272,13 +320,10 @@ def cmd_flash(args):
         except ValueError:
             pass
         # Check if argument is a color directly
-        try:
-            col = parse_color(sub)
-            if col is not None:
-                cmd_flash_color(sub)
-                return
-        except Exception:
-            pass
+        col = parse_color(sub)
+        if col is not None:
+            cmd_flash_color(sub)
+            return
         print(f"Sous-commande flash inconnue: {sub}")
 
 def cmd_color(color_str):
@@ -311,13 +356,13 @@ def cmd_key_list():
     print(f"Touches personnalisées actives ({len(custom_keys)}) :")
     groups = {}
     for kname, cinfo in sorted(custom_keys.items()):
-        col = tuple(cinfo.get("color", [255, 255, 255]))
-        bri = cinfo.get("brightness", 10)
-        groups.setdefault((col, bri), []).append(kname)
+        col_str = fmt_color(cinfo.get("color", [255, 255, 255]))
+        bri_str = fmt_brightness(cinfo.get("brightness", 10))
+        groups.setdefault((col_str, bri_str), []).append(kname)
 
-    for (col, bri), keys in groups.items():
+    for (col_str, bri_str), keys in groups.items():
         keys_str = ", ".join(keys)
-        print(f"  • Couleur: {list(col)}, Luminosité: {bri}/10 -> {keys_str}")
+        print(f"  • Couleur: {col_str}, Luminosité: {bri_str} -> {keys_str}")
 
 def cmd_key_clear():
     cfg = load_config()
@@ -334,15 +379,18 @@ def cmd_key(args):
         print("       aorus rgb key <touches> reset")
         print("       aorus rgb key list")
         print("       aorus rgb key clear")
+        print("\nValeurs spéciales (héritage dynamique) :")
+        print("  inherit, auto, null (ou vide) - hérite de la couleur ou de la luminosité du clavier")
         print("\nExemples:")
-        print("  aorus rgb key super,ctrl,alt,shift red:10")
-        print("  aorus rgb key echap,return,suppre,backspace cyan:8")
-        print("  aorus rgb key wasd yellow 10")
-        print("  aorus rgb key fleches orange:9")
-        print("  aorus rgb key fkeys blue:5")
-        print("  aorus rgb key wasd reset")
-        print("  aorus rgb key clear")
+        print("  aorus rgb key wasd red:10           # Couleur rouge, luminosité 10")
+        print("  aorus rgb key wasd red:inherit      # Couleur rouge, luminosité héritée du clavier")
+        print("  aorus rgb key wasd inherit:10       # Couleur héritée du clavier, luminosité 10")
+        print("  aorus rgb key wasd :10              # Raccourci pour inherit:10")
+        print("  aorus rgb key wasd red:             # Raccourci pour red:inherit")
+        print("  aorus rgb key wasd inherit          # Couleur et luminosité héritées")
+        print("  aorus rgb key super,ctrl reset      # Réinitialise les touches")
         print("  aorus rgb key list")
+        print("  aorus rgb key clear")
         print("")
         cmd_key_list()
         return
@@ -407,54 +455,238 @@ def cmd_key(args):
         print(f"Exemple: aorus rgb key {key_spec} red:10")
         return
 
-    color_str = None
-    brightness = 10
+    color_val = None
+    brightness_val = None
 
-    # Parse color & brightness
-    # Format: color:brightness (e.g. red:10, cyan:5, #028391:8)
+    # Case 1: argument contains ":" (e.g. red:10, red:inherit, red:, :10, inherit:10, inherit:inherit)
     if ":" in args[1]:
-        parts = args[1].split(":", 1)
-        color_str = parts[0]
-        try:
-            brightness = int(parts[1])
-        except ValueError:
-            print(f"Erreur: Luminosité invalide dans '{args[1]}'. Doit être entre 0 et 10.")
-            return
-    elif len(args) >= 3 and args[2].isdigit():
-        # Format: color brightness (e.g. red 10)
-        color_str = args[1]
-        brightness = int(args[2])
-    else:
-        # Check if single arg is number (brightness only) or color
-        if args[1].isdigit():
-            brightness = int(args[1])
-        else:
-            color_str = args[1]
-            brightness = 10
+        c_part, b_part = args[1].split(":", 1)
+        c_part = c_part.strip()
+        b_part = b_part.strip()
 
-    if not (0 <= brightness <= 10):
-        print("Erreur: La luminosité doit être comprise entre 0 et 10.")
-        return
+        # Parse color part
+        if not c_part or is_inherit(c_part):
+            color_val = "inherit"
+        else:
+            color_val = parse_color(c_part)
+            if color_val is None:
+                print(f"Erreur: Couleur '{c_part}' non reconnue.")
+                return
+
+        # Parse brightness part
+        if not b_part or is_inherit(b_part):
+            brightness_val = "inherit"
+        else:
+            try:
+                brightness_val = int(b_part)
+                if not (0 <= brightness_val <= 10):
+                    raise ValueError()
+            except ValueError:
+                print(f"Erreur: Luminosité invalide '{b_part}'. Doit être entre 0 et 10 ou 'inherit'.")
+                return
+
+    # Case 2: two parameters following keys (e.g. `red 10`, `red inherit`, `inherit 10`, `inherit inherit`)
+    elif len(args) >= 3:
+        c_part = args[1].strip()
+        b_part = args[2].strip()
+
+        if is_inherit(c_part):
+            color_val = "inherit"
+        else:
+            color_val = parse_color(c_part)
+            if color_val is None:
+                print(f"Erreur: Couleur '{c_part}' non reconnue.")
+                return
+
+        if is_inherit(b_part):
+            brightness_val = "inherit"
+        else:
+            try:
+                brightness_val = int(b_part)
+                if not (0 <= brightness_val <= 10):
+                    raise ValueError()
+            except ValueError:
+                print(f"Erreur: Luminosité invalide '{b_part}'. Doit être entre 0 et 10 ou 'inherit'.")
+                return
+
+    # Case 3: single parameter following keys (e.g. `inherit`, `auto`, `10`, `red`)
+    else:
+        param = args[1].strip().lower()
+        if is_inherit(param):
+            color_val = "inherit"
+            brightness_val = "inherit"
+        elif param.isdigit():
+            brightness_val = int(param)
+            if not (0 <= brightness_val <= 10):
+                print("Erreur: La luminosité doit être entre 0 et 10.")
+                return
+            color_val = "inherit"
+        else:
+            color_val = parse_color(param)
+            if color_val is None:
+                print(f"Erreur: Couleur '{args[1]}' non reconnue.")
+                return
+            brightness_val = "inherit"
 
     cfg = load_config()
     ck = cfg.get("custom_keys", {})
 
     for k in keys:
-        if color_str:
-            col = parse_color(color_str)
-            if col is None:
-                print(f"Erreur: Couleur '{color_str}' non reconnue.")
-                return
-        else:
-            col = ck.get(k, {}).get("color", [255, 255, 255])
-        ck[k] = {"color": col, "brightness": brightness}
+        ck[k] = {"color": color_val, "brightness": brightness_val}
 
     cfg["custom_keys"] = ck
     save_config(cfg)
     notify_daemon()
+
+    c_disp = "inherit" if color_val == "inherit" else str(color_val)
+    b_disp = "inherit" if brightness_val == "inherit" else f"{brightness_val}/10"
     print(f"✓ {len(keys)} touche(s) configurée(s) : {', '.join(keys)}")
-    print(f"  Couleur: {col}, Luminosité: {brightness}/10")
+    print(f"  Couleur: {c_disp}, Luminosité: {b_disp}")
     cmd_status()
+
+# ----------------- PRESETS MANAGEMENT -----------------
+
+def cmd_preset_save(name):
+    if not name:
+        print("Usage: aorus rgb preset save <nom>")
+        return
+    name = name.strip().lower()
+    if not re.match(r"^[a-zA-Z0-9_\-]+$", name):
+        print(f"Erreur: Le nom '{name}' est invalide (utilisez des lettres, chiffres, tirets ou underscores).")
+        return
+    os.makedirs(PRESETS_DIR, exist_ok=True)
+    cfg = load_config()
+    preset_path = os.path.join(PRESETS_DIR, f"{name}.json")
+    preset_data = {
+        "name": name,
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "backlight": cfg.get("backlight", True),
+        "brightness": cfg.get("brightness", 10),
+        "bg_color": cfg.get("bg_color", [0, 180, 216]),
+        "saved_color": cfg.get("saved_color", [0, 180, 216]),
+        "flash": cfg.get("flash", True),
+        "flash_brightness": cfg.get("flash_brightness", 10),
+        "flash_color": cfg.get("flash_color", [255, 255, 255]),
+        "fade_duration": cfg.get("fade_duration", 0.45),
+        "custom_keys": cfg.get("custom_keys", {})
+    }
+    with open(preset_path, "w") as f:
+        json.dump(preset_data, f, indent=2)
+    ck_count = len(preset_data["custom_keys"])
+    print(f"✓ Preset '{name}' enregistré avec succès ({preset_path}).")
+    print(f"  Fond: {fmt_color(preset_data['bg_color'])} ({fmt_brightness(preset_data['brightness'])}) | "
+          f"Flash: {fmt_color(preset_data['flash_color'])} ({fmt_brightness(preset_data['flash_brightness'])}) | "
+          f"{ck_count} touche(s) personnalisée(s).")
+
+def cmd_preset_load(name):
+    if not name:
+        print("Usage: aorus rgb preset load <nom>")
+        return
+    name = name.strip().lower()
+    if name.endswith(".json"):
+        name = name[:-5]
+    preset_path = os.path.join(PRESETS_DIR, f"{name}.json")
+    if not os.path.exists(preset_path):
+        print(f"Erreur: Preset '{name}' introuvable.")
+        cmd_preset_list()
+        return
+    try:
+        with open(preset_path, "r") as f:
+            preset_data = json.load(f)
+    except Exception as e:
+        print(f"Erreur lors de la lecture du preset '{name}': {e}")
+        return
+
+    cfg = load_config()
+    for key in ("backlight", "brightness", "bg_color", "saved_color", "flash",
+                "flash_brightness", "flash_color", "fade_duration", "custom_keys"):
+        if key in preset_data:
+            cfg[key] = preset_data[key]
+    save_config(cfg)
+    notify_daemon()
+    print(f"✓ Preset '{name}' chargé et appliqué avec succès.")
+    cmd_status()
+
+def cmd_preset_list():
+    os.makedirs(PRESETS_DIR, exist_ok=True)
+    files = sorted(glob.glob(os.path.join(PRESETS_DIR, "*.json")))
+    if not files:
+        print("Aucun preset enregistré.")
+        print("Astuce : utilisez 'aorus rgb preset save <nom>' pour enregistrer la configuration active.")
+        return
+    print(f"Presets disponibles ({len(files)}) :")
+    for fpath in files:
+        bname = os.path.splitext(os.path.basename(fpath))[0]
+        try:
+            with open(fpath, "r") as f:
+                data = json.load(f)
+            s_date = data.get("saved_at", "date inconnue")
+            bg = data.get("bg_color", "?")
+            br = data.get("brightness", "?")
+            fl_col = data.get("flash_color", "?")
+            fl_br = data.get("flash_brightness", "?")
+            ck_cnt = len(data.get("custom_keys", {}))
+            print(f"  • \033[1;36m{bname}\033[0m ({s_date}) : Fond {fmt_color(bg)} ({fmt_brightness(br)}) | "
+                  f"Flash {fmt_color(fl_col)} ({fmt_brightness(fl_br)}) | {ck_cnt} touche(s) persos")
+        except Exception:
+            print(f"  • {bname} (fichier corrompu)")
+
+def cmd_preset_delete(name):
+    if not name:
+        print("Usage: aorus rgb preset delete <nom>")
+        return
+    name = name.strip().lower()
+    if name.endswith(".json"):
+        name = name[:-5]
+    preset_path = os.path.join(PRESETS_DIR, f"{name}.json")
+    if not os.path.exists(preset_path):
+        print(f"Erreur: Preset '{name}' introuvable.")
+        return
+    try:
+        os.remove(preset_path)
+        print(f"✓ Preset '{name}' supprimé avec succès.")
+    except Exception as e:
+        print(f"Erreur lors de la suppression : {e}")
+
+def cmd_preset(args):
+    if not args:
+        print("Usage: aorus rgb preset <save|load|list|delete> [nom]")
+        print("\nCommandes :")
+        print("  aorus rgb preset save <nom>    - Enregistre la configuration active sous ce nom")
+        print("  aorus rgb preset load <nom>    - Charge et applique le preset")
+        print("  aorus rgb preset <nom>         - Raccourci pour charger et appliquer un preset")
+        print("  aorus rgb preset list          - Liste tous les presets enregistrés")
+        print("  aorus rgb preset delete <nom>  - Supprime un preset")
+        print("")
+        cmd_preset_list()
+        return
+
+    sub = args[0].lower().strip()
+    if sub == "save":
+        if len(args) > 1:
+            cmd_preset_save(args[1])
+        else:
+            print("Usage: aorus rgb preset save <nom>")
+    elif sub in ("load", "apply"):
+        if len(args) > 1:
+            cmd_preset_load(args[1])
+        else:
+            print("Usage: aorus rgb preset load <nom>")
+    elif sub in ("list", "ls"):
+        cmd_preset_list()
+    elif sub in ("delete", "remove", "rm"):
+        if len(args) > 1:
+            cmd_preset_delete(args[1])
+        else:
+            print("Usage: aorus rgb preset delete <nom>")
+    else:
+        # Check if sub is directly a preset name
+        preset_path = os.path.join(PRESETS_DIR, f"{sub}.json")
+        if os.path.exists(preset_path):
+            cmd_preset_load(sub)
+        else:
+            print(f"Sous-commande ou preset inconnu : '{sub}'")
+            cmd_preset_list()
 
 def main():
     args = sys.argv[1:]
@@ -471,13 +703,17 @@ def main():
         print("  aorus rgb brightness <0-10>       - Règle l'intensité du clavier (0-10)")
         print("  aorus rgb flash on                - Active le flash à la frappe")
         print("  aorus rgb flash off               - Désactive le flash à la frappe")
-        print("  aorus rgb flash brightness <0-10> - Règle l'intensité du flash (0-10)")
-        print("  aorus rgb flash color <couleur>   - Règle la couleur du flash")
+        print("  aorus rgb flash brightness <b|inherit> - Règle l'intensité du flash")
+        print("  aorus rgb flash color <c|inherit> - Règle la couleur du flash")
         print("  aorus rgb color <couleur>         - Règle la couleur globale (theme, red, 028391...)")
         print("  aorus rgb key <touches> <c[:b]>   - Colorie des touches spécifiques")
         print("  aorus rgb key <touches> reset     - Réinitialise des touches personnalisées")
         print("  aorus rgb key list                - Liste les touches personnalisées")
         print("  aorus rgb key clear               - Réinitialise toutes les touches personnalisées")
+        print("  aorus rgb preset save <nom>       - Enregistre la configuration active en preset")
+        print("  aorus rgb preset load <nom>       - Charge un preset enregistré")
+        print("  aorus rgb preset list             - Liste les presets enregistrés")
+        print("  aorus rgb preset delete <nom>     - Supprime un preset")
         print("  aorus rgb status                  - Affiche l'état")
         print("  aorus rgb restart                 - Redémarre le service")
         return
@@ -504,12 +740,20 @@ def main():
             print("Astuce: en terminal, passez les codes hex sans '#' (ex: 028391) ou entre guillemets (ex: \"#028391\").")
     elif sub == "key":
         cmd_key(args[1:])
+    elif sub == "preset":
+        cmd_preset(args[1:])
     elif sub == "status":
         cmd_status()
     elif sub == "restart":
         restart_service()
         cmd_status()
     else:
+        # Check if argument is an existing preset name
+        preset_path = os.path.join(PRESETS_DIR, f"{sub}.json")
+        if os.path.exists(preset_path):
+            cmd_preset_load(sub)
+            return
+
         # Check if argument is a direct color or hex
         try:
             rgb = parse_color(sub)
