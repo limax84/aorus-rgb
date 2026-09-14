@@ -11,7 +11,7 @@ Contrôleur de rétroéclairage complet et effet réactif touche-par-touche pour
 - ⚡ **Effet Flash Réactif** : Effet de flash à la frappe avec fondu progressif (*fade-out*) personnalisable (couleur et intensité sur 10 indépendantes).
 - 🚀 **Zéro latence & Zéro CPU en fond noir** : Bascule automatique sur le mode réactif matériel natif (Mode 0x04 à 1000 Hz, 0% CPU, 0 paquet USB) lorsque le fond du clavier est éteint.
 - 🌊 **Fondu fluide sans clignotement** : Interpolation *Smoothstep* conçue spécifiquement pour la bande passante USB du contrôleur (93 ms par trame), éliminant tout clignotement ou bégaiement.
-- 🧬 **Héritage dynamique (`inherit`)** : Le flash et les touches personnalisées peuvent hériter de la couleur et/ou de l'intensité du clavier ; elles suivent alors automatiquement tout changement de couleur globale ou de thème.
+- 🧬 **Héritage en cascade (`inherit`)** : Trois étages — clavier → touche personnalisée → flash. Chaque niveau reprend la valeur du niveau au-dessus pour tout ce qu'on laisse en `inherit`, si bien qu'un flash hérité prend la couleur *de la touche frappée* et suit automatiquement les changements de couleur globale ou de thème.
 - 💾 **Presets** : Enregistrement, rechargement et suppression de configurations complètes (fond, flash, touches personnalisées) par un simple nom.
 - 🔄 **Rechargement instantané** : Communication inter-processus par signal (`SIGUSR1`) pour une mise à jour des paramètres en moins d'une milliseconde.
 - ⚙️ **Service Systemd Utilisateur** : Gestion propre en tâche de fond, démarrage automatique avec la session graphique.
@@ -63,9 +63,9 @@ aorus rgb flash toggle            # Alterne on / off
 aorus rgb flash brightness <0-10> # Intensité du flash (ex: aorus rgb flash brightness 10)
 aorus rgb flash color <couleur>   # Couleur du flash (ex: white, green, yellow, purple, #ffffff)
 
-# Héritage : le flash suit la couleur / l'intensité du clavier
-aorus rgb flash color inherit     # Le flash prend la couleur globale du clavier
-aorus rgb flash brightness inherit # Le flash prend l'intensité globale du clavier
+# Héritage : le flash suit la couleur / l'intensité de la touche frappée
+aorus rgb flash color inherit     # Chaque touche flashe vers SA propre couleur
+aorus rgb flash brightness inherit # Chaque touche flashe à SA propre intensité
 aorus rgb flash inherit           # Raccourci : couleur ET intensité héritées
 ```
 
@@ -97,9 +97,19 @@ aorus rgb key clear                 # Efface toutes les personnalisations par to
 
 > **Aliases disponibles (français & anglais)** : `super`, `win`, `ctrl`, `alt`, `shift`, `maj`, `echap`, `escape`, `return`, `entree`, `suppre`, `suppr`, `delete`, `backspace`, `retour`, `tab`, `space`, `espace`, `fleches`, `arrows`, `haut`, `bas`, `gauche`, `droite`, `wasd`, `zqsd`, `fkeys`, `modifiers`, `nav`, `numpad`, `digits`...
 
-### Héritage dynamique (`inherit`)
+### Héritage en cascade (`inherit`)
 
-Partout où une couleur ou une intensité est attendue, la valeur spéciale `inherit` fait suivre le réglage du clavier au lieu de le figer. Synonymes acceptés : `inherit`, `auto`, `null`, ou une valeur vide.
+Partout où une couleur ou une intensité est attendue, la valeur spéciale `inherit` reprend le réglage du niveau au-dessus au lieu de le figer. Synonymes acceptés : `inherit`, `auto`, `null`, ou une valeur vide.
+
+La cascade compte trois étages :
+
+```
+clavier (bg_color + brightness)
+   └─> touche personnalisée (custom_keys[*].color + brightness)
+          └─> flash (flash_color + flash_brightness)
+```
+
+Une touche laissée en `inherit` prend la couleur du clavier ; un flash laissé en `inherit` prend la couleur de **la touche frappée** — laquelle peut elle-même l'avoir héritée du clavier. Concrètement, avec `aorus rgb flash color inherit` sur un clavier cyan où Échap est rouge : Échap flashe vers le rouge, et toutes les touches non personnalisées flashent vers le cyan.
 
 ```bash
 aorus rgb key wasd red:10           # Rouge fixe, intensité 10
@@ -111,6 +121,8 @@ aorus rgb key wasd inherit          # Couleur ET intensité héritées
 ```
 
 Concrètement, `aorus rgb key fkeys inherit:10` met les touches F1–F12 dans la teinte du clavier mais à pleine intensité : elles ressortent sans être d'une autre couleur, et elles suivront le prochain `aorus rgb color`.
+
+> **À noter** : `flash brightness inherit` fait flasher chaque touche à sa propre intensité de repos. L'effet est alors subtil, et nul pour une touche déjà à 10/10 (elle est déjà au maximum de sa couleur). Pour un flash hérité bien visible, combinez `flash color inherit` avec `flash brightness 10`.
 
 > **À noter** : `none` reste le synonyme de *noir* (`aorus rgb color none` éteint le fond) et n'est donc pas une valeur d'héritage.
 

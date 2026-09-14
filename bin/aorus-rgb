@@ -226,7 +226,7 @@ def cmd_brightness(val_str):
 def cmd_flash_brightness(val_str):
     if is_inherit(val_str):
         val = "inherit"
-        desc = "INHERIT (hérite de l'intensité du clavier)"
+        desc = "INHERIT (hérite de l'intensité de chaque touche)"
     else:
         try:
             val = int(val_str)
@@ -247,7 +247,7 @@ def cmd_flash_brightness(val_str):
 def cmd_flash_color(color_str):
     if is_inherit(color_str):
         col = "inherit"
-        desc = "INHERIT (hérite de la couleur du clavier)"
+        desc = "INHERIT (hérite de la couleur de chaque touche)"
     else:
         col = parse_color(color_str)
         if col is None:
@@ -297,7 +297,7 @@ def cmd_flash(args):
         cfg["flash"] = True
         save_config(cfg)
         notify_daemon()
-        print("✓ Effet flash réglé sur INHERIT (couleur et luminosité héritées du clavier).")
+        print("✓ Effet flash réglé sur INHERIT (couleur et luminosité héritées de chaque touche).")
         cmd_status()
     elif sub in ("brightness", "intensity"):
         if len(args) > 1:
@@ -380,7 +380,8 @@ def cmd_key(args):
         print("       aorus rgb key list")
         print("       aorus rgb key clear")
         print("\nValeurs spéciales (héritage dynamique) :")
-        print("  inherit, auto, null (ou vide) - hérite de la couleur ou de la luminosité du clavier")
+        print("  inherit, auto, null (ou vide) - hérite du niveau au-dessus dans la cascade")
+        print("  Cascade : clavier -> touche personnalisée -> flash")
         print("\nExemples:")
         print("  aorus rgb key wasd red:10           # Couleur rouge, luminosité 10")
         print("  aorus rgb key wasd red:inherit      # Couleur rouge, luminosité héritée du clavier")

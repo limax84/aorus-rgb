@@ -88,19 +88,23 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
     "KEY_F1": {"color": [255, 0, 0], "brightness": "inherit"}
   }
   ```
-- **Héritage dynamique (`inherit`)** :
+- **Héritage en cascade (`inherit`)** :
+  - Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau reprend la valeur du niveau au-dessus pour chaque champ laissé en `inherit`.
   - `is_inherit(val)` (dans `src/aorus_rgb.py`) est le point de vérité unique : renvoie `True` pour `None` et pour les chaînes `inherit`, `auto`, `clavier`, `kbl`, `null`, `default` et la chaîne vide.
   - **`none` est volontairement exclu** de cette liste : c'est l'alias historique de *noir* dans `parse_color()` (`aorus rgb color none` éteint le fond). Ne pas le réintroduire dans `is_inherit()` sans traiter la régression sur `cmd_color`.
   - `parse_color()` renvoie `None` pour toute valeur d'héritage ; les appelants doivent donc distinguer « couleur invalide » et « héritage » via `is_inherit()` **avant** d'appeler `parse_color()`.
-  - S'applique à `flash_color`, `flash_brightness` et à chaque entrée de `custom_keys`.
-  - Résolution côté démon (`run_daemon`) : `raw_bg` est la couleur de fond **non atténuée**, `b_val` l'intensité globale. Une couleur héritée reçoit `raw_bg` ; une intensité héritée reçoit `b_val`. `compute_key_base_colors(cfg, effective_bg, raw_bg, global_b)` reçoit ces deux valeurs en paramètres.
-  - Conséquence utile : `color: "inherit"` + `brightness: 10` donne la teinte du clavier à pleine intensité — la touche ressort sans changer de teinte et suit les changements de `bg_color`.
+  - **Pipeline de résolution** (dans `run_daemon`, à chaque rechargement de config) :
+    1. `resolve_key_settings(cfg, raw_bg, b_val)` → `{pos: (raw_color, brightness)}`. Étage 1 : chaque touche personnalisée retombe sur `raw_bg` (couleur de fond **non atténuée**) et/ou `b_val` (intensité globale). La brillance est conservée sur l'échelle 0-10, non pré-multipliée, précisément pour que le flash puisse en hériter ensuite.
+    2. `compute_key_base_colors(cfg, effective_bg, key_settings)` → couleurs de repos (`raw_color × brightness/10` via `scale_color`).
+    3. `compute_key_flash_colors(cfg, key_settings, base_map)` → couleur de **pic** du flash, par position. Étage 2 : un `flash_color` hérité prend `raw_color` de la touche, un `flash_brightness` hérité prend sa `brightness`. Le pic est `base + (cible - base) × facteur`, ce qui reproduit à l'identique l'ancien comportement quand le flash n'hérite de rien.
+  - Le flash est donc résolu **par touche**, pas globalement. Les variables `flash_col` / `fb_val` globales qui subsistent dans `run_daemon` ne servent plus qu'au **mode matériel 0x04** (monochrome par construction) et au test d'activation du flash.
+  - Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque touche à sa propre intensité de repos — effet nul pour une touche déjà à 10/10. Le réglage utile est `flash_color: "inherit"` + `flash_brightness: 10`.
   - Côté CLI, `fmt_color()` et `fmt_brightness()` sont les helpers d'affichage à réutiliser (ils gèrent le cas `inherit`) ; ne pas réécrire de formatage inline.
 
 - **Rendu & Flash réactif** :
-  - `compute_key_base_colors(cfg, effective_bg, raw_bg, global_b)` calcule la couleur de repos de chaque LED.
+  - `compute_key_base_colors(cfg, effective_bg, key_settings)` calcule la couleur de repos de chaque LED, `compute_key_flash_colors()` la couleur de pic du flash.
   - En mode matrice personnalisée, la luminosité matérielle (`hw_b`) reste calée à 50 (pleine échelle), et chaque touche est modulée directement en valeur RGB logicielle.
-  - Lorsqu'une touche personnalisée est pressée, elle flashe selon `flash_color` et revient en fondu progressif vers sa couleur personnalisée spécifique.
+  - Lorsqu'une touche est pressée, elle flashe vers son pic (`flash_map[pos]`, pré-calculé) puis revient en fondu progressif vers sa couleur de repos.
 
 ---
 

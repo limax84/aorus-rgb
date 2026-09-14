@@ -189,7 +189,11 @@ DEFAULT_CONFIG = {
 
 
 def is_inherit(val):
-    """Check if a color or brightness value is set to inherit from keyboard background."""
+    """Check if a color or brightness value is left to the inheritance chain.
+
+    The chain runs keyboard background -> custom key -> flash: each level
+    falls back to the one above it for every value left to `inherit`.
+    """
     if val is None:
         return True
     if isinstance(val, str):
@@ -199,39 +203,83 @@ def is_inherit(val):
     return False
 
 
-def compute_key_base_colors(cfg, effective_bg, raw_bg=None, global_b=10):
+def scale_color(col, brightness):
+    """Attenuate an unattenuated color by a 0-10 brightness level."""
+    f = max(0, min(10, brightness)) / 10.0
+    return (int(col[0] * f), int(col[1] * f), int(col[2] * f))
+
+
+def resolve_brightness(raw, fallback):
+    """Resolve a brightness setting to the 0-10 scale, inheriting when unset."""
+    if is_inherit(raw):
+        return fallback
+    try:
+        return max(0, min(10, int(raw)))
+    except (ValueError, TypeError):
+        return fallback
+
+
+def resolve_key_settings(cfg, raw_bg, global_b):
+    """Resolve the unattenuated color and brightness of every LED position.
+
+    This is the first rung of the inheritance chain: a custom key falls back
+    to the keyboard background color and/or brightness for each value it
+    leaves to `inherit`. Returns {pos: (raw_color, brightness)}, brightness
+    being on the 0-10 scale so that the flash can inherit it in turn.
+    """
+    raw_bg = tuple(raw_bg)
+    settings = {pos: (raw_bg, global_b) for pos in VALID_POSITIONS}
+
+    for kname, cinfo in cfg.get("custom_keys", {}).items():
+        pos = EVDEV_TO_LED.get(kname)
+        if pos not in settings:
+            continue
+        raw_col = cinfo.get("color")
+        if is_inherit(raw_col):
+            col = raw_bg
+        else:
+            parsed = parse_color(raw_col, default=None)
+            col = tuple(parsed) if parsed is not None else raw_bg
+        settings[pos] = (col, resolve_brightness(cinfo.get("brightness"), global_b))
+    return settings
+
+
+def compute_key_base_colors(cfg, effective_bg, key_settings=None):
     """Compute base (idle) color for each of the valid LED positions."""
-    custom_keys = cfg.get("custom_keys", {})
-    backlight_on = cfg.get("backlight", True)
-    base_map = {pos: tuple(effective_bg) for pos in VALID_POSITIONS}
-    if not backlight_on:
-        return base_map
-    if raw_bg is None:
-        raw_bg = effective_bg
+    if not cfg.get("backlight", True) or key_settings is None:
+        return {pos: tuple(effective_bg) for pos in VALID_POSITIONS}
+    return {pos: scale_color(col, bri) for pos, (col, bri) in key_settings.items()}
 
-    for kname, cinfo in custom_keys.items():
-        if kname in EVDEV_TO_LED:
-            pos = EVDEV_TO_LED[kname]
-            raw_col = cinfo.get("color")
-            if is_inherit(raw_col):
-                col = raw_bg
-            else:
-                col = parse_color(raw_col, default=[255, 255, 255])
-                if col is None:
-                    col = raw_bg
 
-            raw_bri = cinfo.get("brightness")
-            if is_inherit(raw_bri):
-                br_val = global_b
-            else:
-                try:
-                    br_val = max(0, min(10, int(raw_bri)))
-                except (ValueError, TypeError):
-                    br_val = global_b
+def compute_key_flash_colors(cfg, key_settings, base_map):
+    """Compute the peak flash color of every LED position.
 
-            br = br_val / 10.0
-            base_map[pos] = (int(col[0] * br), int(col[1] * br), int(col[2] * br))
-    return base_map
+    Second rung of the inheritance chain: the flash falls back to each key's
+    own resolved color and/or brightness for the values left to `inherit` --
+    so a key already inheriting from the keyboard propagates that color all
+    the way to its flash. The peak is the key's base color blended toward the
+    flash color by the flash brightness, which keeps a non-inherited flash
+    behaving exactly as before.
+    """
+    raw_fc = cfg.get("flash_color", [255, 255, 255])
+    raw_fb = cfg.get("flash_brightness", 10)
+    fc_inherits = is_inherit(raw_fc)
+    fb_inherits = is_inherit(raw_fb)
+
+    flash_col = None
+    if not fc_inherits:
+        flash_col = parse_color(raw_fc, default=[255, 255, 255])
+        if flash_col is None:
+            flash_col = [255, 255, 255]
+    flash_bri = None if fb_inherits else resolve_brightness(raw_fb, 10)
+
+    peaks = {}
+    for pos, (key_col, key_bri) in key_settings.items():
+        target = key_col if fc_inherits else flash_col
+        factor = (key_bri if fb_inherits else flash_bri) / 10.0
+        base = base_map.get(pos, (0, 0, 0))
+        peaks[pos] = tuple(int(b + (t - b) * factor) for b, t in zip(base, target))
+    return peaks
 
 
 def load_config():
@@ -512,15 +560,10 @@ def run_daemon():
         flash_enabled = cfg.get("flash", True)
         b_val = max(0, min(10, int(cfg.get("brightness", 10))))
 
-        # Flash brightness resolution
-        raw_fb = cfg.get("flash_brightness", 10)
-        if is_inherit(raw_fb):
-            fb_val = b_val
-        else:
-            try:
-                fb_val = max(0, min(10, int(raw_fb)))
-            except (ValueError, TypeError):
-                fb_val = 10
+        # Global flash brightness. Only drives the hardware reactive mode and
+        # the on/off test: in matrix mode the flash brightness is resolved per
+        # key by compute_key_flash_colors(), which may inherit each key's own.
+        fb_val = resolve_brightness(cfg.get("flash_brightness", 10), b_val)
 
         fade_duration = float(cfg.get("fade_duration", 0.45))
 
@@ -538,10 +581,11 @@ def run_daemon():
         if not backlight_on or b_val == 0:
             effective_bg = [0, 0, 0]
         else:
-            b_factor = b_val / 10.0
-            effective_bg = [int(c * b_factor) for c in raw_bg]
+            effective_bg = list(scale_color(raw_bg, b_val))
 
-        # Flash color resolution
+        # Global flash color, used by the hardware reactive mode only: that
+        # mode has a single color for the whole keyboard, so an inherited
+        # flash falls back to the background (white if the background is off).
         raw_flash_col = cfg.get("flash_color", [255, 255, 255])
         if is_inherit(raw_flash_col):
             flash_col = raw_bg if raw_bg != [0, 0, 0] else [255, 255, 255]
@@ -553,11 +597,16 @@ def run_daemon():
         # Dark hardware reactive mode is used ONLY if whole keyboard is dark AND (backlight is off OR no custom keys)
         is_dark = (effective_bg == [0, 0, 0] and (not backlight_on or not has_custom_keys))
 
-        # Compute per-key base colors
-        base_map = compute_key_base_colors(cfg, effective_bg, raw_bg=raw_bg, global_b=b_val)
+        # Inheritance chain: keyboard -> custom key -> flash
+        key_settings = resolve_key_settings(cfg, raw_bg, b_val)
+        base_map = compute_key_base_colors(cfg, effective_bg, key_settings)
+        flash_map = compute_key_flash_colors(cfg, key_settings, base_map)
         ck_hash = json.dumps(custom_keys, sort_keys=True)
 
-        current_state_key = (backlight_on, flash_enabled, b_val, fb_val, tuple(effective_bg), tuple(raw_bg), tuple(flash_col), ck_hash)
+        current_state_key = (backlight_on, flash_enabled, b_val, fb_val, tuple(effective_bg),
+                             tuple(raw_bg), tuple(flash_col), ck_hash,
+                             json.dumps(cfg.get("flash_color"), sort_keys=True),
+                             json.dumps(cfg.get("flash_brightness"), sort_keys=True))
 
         # --- CASE 1: Clavier éteint (fond noir sans touches personnalisées) ---
         if is_dark:
@@ -631,8 +680,6 @@ def run_daemon():
             cur_time = time.time()
             frame_keys = {}
             to_remove = []
-            f_factor = fb_val / 10.0
-
             for pos in VALID_POSITIONS:
                 base_col = base_map.get(pos, tuple(effective_bg))
                 if pos in active_fades:
@@ -644,7 +691,7 @@ def run_daemon():
                         ratio = elapsed / fade_duration
                         # Smoothstep easing for fluid LED fade without stepping
                         factor = 1.0 - (3.0 * ratio * ratio - 2.0 * ratio * ratio * ratio)
-                        peak_col = [int(bc + (fl - bc) * f_factor) for bc, fl in zip(base_col, flash_col)]
+                        peak_col = flash_map.get(pos, base_col)
                         r = int(peak_col[0] * factor + base_col[0] * (1.0 - factor))
                         g = int(peak_col[1] * factor + base_col[1] * (1.0 - factor))
                         b = int(peak_col[2] * factor + base_col[2] * (1.0 - factor))
