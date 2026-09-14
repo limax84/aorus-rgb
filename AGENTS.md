@@ -69,10 +69,25 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 
 ---
 
-## 4. Layout et Mapping des Touches (evdev -> LED Pos 0..127)
+## 4. Layout, Mapping et Coloration par Touche (Per-Key)
 
-Le dictionnaire `EVDEV_TO_LED` dans `src/aorus_rgb.py` mappe les codes evdev Linux (ex: `KEY_SPACE`) vers les positions de LED internes Gigabyte (ex: `42`).
-Consulter `src/aorus_rgb.py` pour la table complète des 101 touches testées et validées.
+- Le dictionnaire `EVDEV_TO_LED` dans `src/aorus_rgb.py` mappe les codes evdev Linux (ex: `KEY_SPACE`) vers les positions de LED internes Gigabyte (ex: `42`).
+- Le dictionnaire `KEY_ALIASES` et la fonction `resolve_keys()` résolvent les noms usuels français et anglais (avec ou sans accents) vers les identifiants evdev :
+  - Modificateurs : `super`, `win`, `ctrl`, `alt`, `shift`, `maj`, `caps`, `fn`...
+  - Navigation/édition : `echap`, `escape`, `return`, `entree`, `suppre`, `suppr`, `delete`, `backspace`, `retour`...
+  - Direction : `fleches`, `arrows`, `haut`, `bas`, `gauche`, `droite`...
+  - Groupes : `wasd`, `zqsd`, `fkeys`, `modifiers`, `nav`, `numpad`, `digits`...
+- **Format de configuration `custom_keys`** :
+  ```json
+  "custom_keys": {
+    "KEY_ESC": {"color": [255, 0, 0], "brightness": 10},
+    "KEY_LEFTMETA": {"color": [0, 220, 255], "brightness": 8}
+  }
+  ```
+- **Rendu & Flash réactif** :
+  - `compute_key_base_colors(cfg, effective_bg)` calcule la couleur de repos de chaque LED.
+  - En mode matrice personnalisée, la luminosité matérielle (`hw_b`) reste calée à 50 (pleine échelle), et chaque touche est modulée directement en valeur RGB logicielle.
+  - Lorsqu'une touche personnalisée est pressée, elle flashe selon `flash_color` et revient en fondu progressif vers sa couleur personnalisée spécifique.
 
 ---
 
@@ -82,8 +97,12 @@ Le binaire `aorus-rgb` (et son alias `aorus rgb`) supporte :
 - `aorus rgb on` / `aorus rgb off` / `aorus rgb toggle`
 - `aorus rgb brightness <0-10>`
 - `aorus rgb color <couleur>` (nom usuel, `theme`, ou code `#hex` / `hex`)
-- `aorus rgb flash on` / `aorus rgb flash off`
+- `aorus rgb flash on` / `aorus rgb flash off` / `aorus rgb flash toggle`
 - `aorus rgb flash brightness <0-10>`
 - `aorus rgb flash color <couleur>`
+- `aorus rgb key <touches> <couleur[:luminosité]> [luminosité]`
+- `aorus rgb key <touches> reset`
+- `aorus rgb key list`
+- `aorus rgb key clear`
 - `aorus rgb status`
 - `aorus rgb restart`

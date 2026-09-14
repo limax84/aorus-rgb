@@ -7,12 +7,16 @@ Commandes :
   aorus rgb off                     - Éteint le rétroéclairage
   aorus rgb toggle                  - Alterne rétroéclairage on / off
   aorus rgb brightness <0-10>       - Règle l'intensité du rétroéclairage (sur 10)
-  aorus rgb flash on                - Active l'effet de touche blanche
-  aorus rgb flash off               - Désactive l'effet de touche blanche
+  aorus rgb flash on                - Active l'effet de touche à la frappe
+  aorus rgb flash off               - Désactive l'effet de touche à la frappe
   aorus rgb flash toggle            - Alterne l'effet flash on / off
   aorus rgb flash brightness <0-10> - Règle l'intensité du flash (sur 10)
   aorus rgb flash color <couleur>   - Règle la couleur du flash (white, yellow, cyan, #hex...)
-  aorus rgb color <couleur>         - Règle la couleur du clavier (black, theme, red, 028391, #hex...)
+  aorus rgb color <couleur>         - Règle la couleur globale (black, theme, red, 028391, #hex...)
+  aorus rgb key <touches> <c[:b]>   - Colorie des touches fixes (ex: super,ctrl,alt red:10)
+  aorus rgb key <touches> reset     - Réinitialise des touches vers la couleur globale
+  aorus rgb key list                - Liste les touches personnalisées actives
+  aorus rgb key clear               - Réinitialise toutes les touches personnalisées
   aorus rgb status                  - Affiche l'état complet
   aorus rgb restart                 - Redémarre le service
 """
@@ -23,6 +27,15 @@ import json
 import time
 import subprocess
 import signal
+
+# Add library paths (Dev repo first if running from source, then local install)
+REPO_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+LOCAL_SRC = os.path.expanduser("~/.local/share/aorus-rgb")
+for p in [REPO_SRC, LOCAL_SRC]:
+    if os.path.exists(p) and p not in sys.path:
+        sys.path.insert(0, p)
+
+from aorus_rgb import parse_color, resolve_keys, get_theme_accent_color, KEY_ALIASES, EVDEV_TO_LED
 
 CONFIG_DIR = os.path.expanduser("~/.config/aorus-rgb")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
@@ -36,7 +49,8 @@ DEFAULT_CONFIG = {
     "brightness": 10,
     "flash_brightness": 10,
     "flash_color": [255, 255, 255],
-    "fade_duration": 0.45
+    "fade_duration": 0.45,
+    "custom_keys": {}
 }
 
 def load_config():
@@ -90,20 +104,27 @@ def cmd_status():
     fb_val = cfg.get("flash_brightness", 10)
     bg = cfg.get("bg_color", [0, 180, 216])
     fl_col = cfg.get("flash_color", [255, 255, 255])
+    custom_keys = cfg.get("custom_keys", {})
     is_dark = (bg == [0, 0, 0] or not bl_on or b_val == 0)
 
     bl_str = f"\033[1;32mALLUMÉ ({b_val}/10)\033[0m" if (bl_on and b_val > 0) else "\033[1;30mÉTEINT\033[0m"
     flash_str = f"\033[1;32mACTIVÉ ({fb_val}/10, couleur: {fl_col})\033[0m" if (flash_on and fb_val > 0) else "\033[1;31mDÉSACTIVÉ\033[0m"
     svc_str = "\033[1;32mActif\033[0m" if svc_active else "\033[1;31mInactif\033[0m"
 
-    if is_dark:
+    if is_dark and not custom_keys:
         mode_desc = "Clavier éteint (fond noir)"
         if flash_on and fb_val > 0:
             mode_desc += f" + Flash réactif {fl_col} ({fb_val}/10)"
         else:
             mode_desc += " (aucun effet)"
+    elif is_dark and custom_keys:
+        mode_desc = f"Fond éteint + {len(custom_keys)} touche(s) personnalisée(s)"
+        if flash_on and fb_val > 0:
+            mode_desc += f" + Flash {fl_col} ({fb_val}/10)"
     else:
         mode_desc = f"Clavier coloré {bg} ({b_val}/10)"
+        if custom_keys:
+            mode_desc += f" + {len(custom_keys)} touche(s) persos"
         if flash_on and fb_val > 0:
             mode_desc += f" + Flash réactif {fl_col} ({fb_val}/10)"
         else:
@@ -113,8 +134,18 @@ def cmd_status():
     print(f" Rétroéclairage : {bl_str}")
     print(f" Effet Flash    : {flash_str}")
     print(f" Couleur active : {bg if bl_on else '[0, 0, 0] (éteint)'}")
+    print(f" Touches persos : {len(custom_keys)} active(s)" if custom_keys else " Touches persos : Aucune")
     print(f" Mode détecté   : {mode_desc}")
     print(f" Service systemd: {svc_str}")
+    if custom_keys:
+        print(" ────────────────────────────────────────────────────────────")
+        groups = {}
+        for kname, cinfo in sorted(custom_keys.items()):
+            col = tuple(cinfo.get("color", [255, 255, 255]))
+            bri = cinfo.get("brightness", 10)
+            groups.setdefault((col, bri), []).append(kname)
+        for (col, bri), keys in groups.items():
+            print(f"  • {list(col)} ({bri}/10) : {', '.join(keys)}")
     print("════════════════════════════════════════════════════════════")
 
 def cmd_on():
@@ -125,7 +156,6 @@ def cmd_on():
     if cfg.get("bg_color") == [0, 0, 0]:
         saved = cfg.get("saved_color", [0, 180, 216])
         if saved == [0, 0, 0]:
-            from aorus_rgb import get_theme_accent_color
             saved = get_theme_accent_color()
         cfg["bg_color"] = saved
     save_config(cfg)
@@ -181,7 +211,6 @@ def cmd_flash_brightness(val_str):
     cmd_status()
 
 def cmd_flash_color(color_str):
-    from aorus_rgb import parse_color
     col = parse_color(color_str)
     if col is None:
         print(f"Erreur: Couleur '{color_str}' non reconnue.")
@@ -243,7 +272,6 @@ def cmd_flash(args):
         except ValueError:
             pass
         # Check if argument is a color directly
-        from aorus_rgb import parse_color
         try:
             col = parse_color(sub)
             if col is not None:
@@ -255,7 +283,6 @@ def cmd_flash(args):
 
 def cmd_color(color_str):
     cfg = load_config()
-    from aorus_rgb import parse_color
     rgb = parse_color(color_str)
     if rgb is None:
         print(f"Erreur: Couleur '{color_str}' non reconnue.")
@@ -275,9 +302,161 @@ def cmd_color(color_str):
         print(f"✓ Couleur réglée sur {rgb} (fond coloré détecté).")
     cmd_status()
 
-def main():
-    sys.path.insert(0, os.path.expanduser("~/.local/share/aorus-rgb"))
+def cmd_key_list():
+    cfg = load_config()
+    custom_keys = cfg.get("custom_keys", {})
+    if not custom_keys:
+        print("Aucune touche personnalisée configurée.")
+        return
+    print(f"Touches personnalisées actives ({len(custom_keys)}) :")
+    groups = {}
+    for kname, cinfo in sorted(custom_keys.items()):
+        col = tuple(cinfo.get("color", [255, 255, 255]))
+        bri = cinfo.get("brightness", 10)
+        groups.setdefault((col, bri), []).append(kname)
 
+    for (col, bri), keys in groups.items():
+        keys_str = ", ".join(keys)
+        print(f"  • Couleur: {list(col)}, Luminosité: {bri}/10 -> {keys_str}")
+
+def cmd_key_clear():
+    cfg = load_config()
+    count = len(cfg.get("custom_keys", {}))
+    cfg["custom_keys"] = {}
+    save_config(cfg)
+    notify_daemon()
+    print(f"✓ {count} touche(s) personnalisée(s) réinitialisée(s). Clavier remis en couleur globale.")
+    cmd_status()
+
+def cmd_key(args):
+    if not args:
+        print("Usage: aorus rgb key <touches> <couleur[:luminosité]> [luminosité]")
+        print("       aorus rgb key <touches> reset")
+        print("       aorus rgb key list")
+        print("       aorus rgb key clear")
+        print("\nExemples:")
+        print("  aorus rgb key super,ctrl,alt,shift red:10")
+        print("  aorus rgb key echap,return,suppre,backspace cyan:8")
+        print("  aorus rgb key wasd yellow 10")
+        print("  aorus rgb key fleches orange:9")
+        print("  aorus rgb key fkeys blue:5")
+        print("  aorus rgb key wasd reset")
+        print("  aorus rgb key clear")
+        print("  aorus rgb key list")
+        print("")
+        cmd_key_list()
+        return
+
+    sub = args[0].lower().strip()
+    if sub == "list":
+        cmd_key_list()
+        return
+    if sub == "clear":
+        cmd_key_clear()
+        return
+
+    # Check for "reset <keys>" syntax
+    if sub == "reset":
+        if len(args) < 2:
+            print("Usage: aorus rgb key reset <touches>")
+            return
+        keys = resolve_keys(args[1])
+        if not keys:
+            print(f"Erreur: Aucune touche reconnue pour '{args[1]}'.")
+            return
+        cfg = load_config()
+        ck = cfg.get("custom_keys", {})
+        for k in keys:
+            ck.pop(k, None)
+        cfg["custom_keys"] = ck
+        save_config(cfg)
+        notify_daemon()
+        print(f"✓ Touche(s) réinitialisée(s): {', '.join(keys)}")
+        cmd_status()
+        return
+
+    # Check for "<keys> reset" syntax
+    if len(args) >= 2 and args[1].lower().strip() == "reset":
+        keys = resolve_keys(args[0])
+        if not keys:
+            print(f"Erreur: Aucune touche reconnue pour '{args[0]}'.")
+            return
+        cfg = load_config()
+        ck = cfg.get("custom_keys", {})
+        for k in keys:
+            ck.pop(k, None)
+        cfg["custom_keys"] = ck
+        save_config(cfg)
+        notify_daemon()
+        print(f"✓ Touche(s) réinitialisée(s): {', '.join(keys)}")
+        cmd_status()
+        return
+
+    # Parse target keys
+    key_spec = args[0]
+    keys = resolve_keys(key_spec)
+    if not keys:
+        print(f"Erreur: Aucune touche reconnue pour '{key_spec}'.")
+        print("Aliases supportés: super, ctrl, alt, shift, echap, return, suppre, backspace,")
+        print("                   wasd, zqsd, fleches, arrows, fkeys, modifiers, nav, numpad, digits...")
+        return
+
+    if len(args) < 2:
+        print(f"Touches ciblées : {', '.join(keys)}")
+        print("Usage: aorus rgb key <touches> <couleur[:luminosité]> [luminosité]")
+        print(f"Exemple: aorus rgb key {key_spec} red:10")
+        return
+
+    color_str = None
+    brightness = 10
+
+    # Parse color & brightness
+    # Format: color:brightness (e.g. red:10, cyan:5, #028391:8)
+    if ":" in args[1]:
+        parts = args[1].split(":", 1)
+        color_str = parts[0]
+        try:
+            brightness = int(parts[1])
+        except ValueError:
+            print(f"Erreur: Luminosité invalide dans '{args[1]}'. Doit être entre 0 et 10.")
+            return
+    elif len(args) >= 3 and args[2].isdigit():
+        # Format: color brightness (e.g. red 10)
+        color_str = args[1]
+        brightness = int(args[2])
+    else:
+        # Check if single arg is number (brightness only) or color
+        if args[1].isdigit():
+            brightness = int(args[1])
+        else:
+            color_str = args[1]
+            brightness = 10
+
+    if not (0 <= brightness <= 10):
+        print("Erreur: La luminosité doit être comprise entre 0 et 10.")
+        return
+
+    cfg = load_config()
+    ck = cfg.get("custom_keys", {})
+
+    for k in keys:
+        if color_str:
+            col = parse_color(color_str)
+            if col is None:
+                print(f"Erreur: Couleur '{color_str}' non reconnue.")
+                return
+        else:
+            col = ck.get(k, {}).get("color", [255, 255, 255])
+        ck[k] = {"color": col, "brightness": brightness}
+
+    cfg["custom_keys"] = ck
+    save_config(cfg)
+    notify_daemon()
+    print(f"✓ {len(keys)} touche(s) configurée(s) : {', '.join(keys)}")
+    print(f"  Couleur: {col}, Luminosité: {brightness}/10")
+    cmd_status()
+
+def main():
     args = sys.argv[1:]
     # Support "aorus rgb ..." syntax
     if args and args[0].lower() == "rgb":
@@ -294,7 +473,11 @@ def main():
         print("  aorus rgb flash off               - Désactive le flash à la frappe")
         print("  aorus rgb flash brightness <0-10> - Règle l'intensité du flash (0-10)")
         print("  aorus rgb flash color <couleur>   - Règle la couleur du flash")
-        print("  aorus rgb color <couleur>         - Règle la couleur de fond (theme, red, 028391...)")
+        print("  aorus rgb color <couleur>         - Règle la couleur globale (theme, red, 028391...)")
+        print("  aorus rgb key <touches> <c[:b]>   - Colorie des touches spécifiques")
+        print("  aorus rgb key <touches> reset     - Réinitialise des touches personnalisées")
+        print("  aorus rgb key list                - Liste les touches personnalisées")
+        print("  aorus rgb key clear               - Réinitialise toutes les touches personnalisées")
         print("  aorus rgb status                  - Affiche l'état")
         print("  aorus rgb restart                 - Redémarre le service")
         return
@@ -319,6 +502,8 @@ def main():
         else:
             print("Usage: aorus rgb color <theme|black|red|cyan|blue|028391|#hex>")
             print("Astuce: en terminal, passez les codes hex sans '#' (ex: 028391) ou entre guillemets (ex: \"#028391\").")
+    elif sub == "key":
+        cmd_key(args[1:])
     elif sub == "status":
         cmd_status()
     elif sub == "restart":
@@ -326,7 +511,6 @@ def main():
         cmd_status()
     else:
         # Check if argument is a direct color or hex
-        from aorus_rgb import parse_color
         try:
             rgb = parse_color(sub)
             if rgb is not None:

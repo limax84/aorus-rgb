@@ -27,6 +27,8 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 PID_FILE = os.path.join(CONFIG_DIR, "daemon.pid")
 OMARCHY_THEME_FILE = os.path.expanduser("~/.config/omarchy/current/theme/colors.toml")
 
+import unicodedata
+
 # 101 keys layout mapping (evdev keyname -> Aorus LED position 0..127)
 EVDEV_TO_LED = {
     # Function row
@@ -72,6 +74,107 @@ EVDEV_TO_LED = {
 
 VALID_POSITIONS = sorted(list(set(EVDEV_TO_LED.values())))
 
+# Human-friendly French & English key name aliases (normalized without accents)
+KEY_ALIASES = {
+    # Modifiers & System
+    "esc": ["KEY_ESC"], "echap": ["KEY_ESC"], "escape": ["KEY_ESC"],
+    "super": ["KEY_LEFTMETA"], "win": ["KEY_LEFTMETA"], "windows": ["KEY_LEFTMETA"], "meta": ["KEY_LEFTMETA"], "cmd": ["KEY_LEFTMETA"],
+    "ctrl": ["KEY_LEFTCTRL", "KEY_RIGHTCTRL"], "control": ["KEY_LEFTCTRL", "KEY_RIGHTCTRL"],
+    "lctrl": ["KEY_LEFTCTRL"], "rctrl": ["KEY_RIGHTCTRL"],
+    "ctrl_gauche": ["KEY_LEFTCTRL"], "ctrl_droit": ["KEY_RIGHTCTRL"],
+    "alt": ["KEY_LEFTALT", "KEY_RIGHTALT"], "lalt": ["KEY_LEFTALT"], "ralt": ["KEY_RIGHTALT"], "altgr": ["KEY_RIGHTALT"],
+    "alt_gauche": ["KEY_LEFTALT"], "alt_droit": ["KEY_RIGHTALT"],
+    "shift": ["KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"], "maj": ["KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"],
+    "lshift": ["KEY_LEFTSHIFT"], "rshift": ["KEY_RIGHTSHIFT"],
+    "shift_gauche": ["KEY_LEFTSHIFT"], "shift_droit": ["KEY_RIGHTSHIFT"],
+    "enter": ["KEY_ENTER"], "entree": ["KEY_ENTER"], "return": ["KEY_ENTER"],
+    "kpenter": ["KEY_KPENTER"], "kp_enter": ["KEY_KPENTER"],
+    "backspace": ["KEY_BACKSPACE"], "retour": ["KEY_BACKSPACE"], "bksp": ["KEY_BACKSPACE"], "effacer": ["KEY_BACKSPACE"], "retour_arriere": ["KEY_BACKSPACE"],
+    "del": ["KEY_DELETE"], "delete": ["KEY_DELETE"], "suppr": ["KEY_DELETE"], "suppre": ["KEY_DELETE"], "supprime": ["KEY_DELETE"], "supprimer": ["KEY_DELETE"],
+    "space": ["KEY_SPACE"], "espace": ["KEY_SPACE"],
+    "tab": ["KEY_TAB"], "tabulation": ["KEY_TAB"],
+    "caps": ["KEY_CAPSLOCK"], "capslock": ["KEY_CAPSLOCK"], "verrmaj": ["KEY_CAPSLOCK"], "verr_maj": ["KEY_CAPSLOCK"],
+    "fn": ["KEY_FN"],
+    "compose": ["KEY_COMPOSE"], "menu": ["KEY_MENU"],
+    "pause": ["KEY_PAUSE"], "arret_defil": ["KEY_PAUSE"],
+    "numlock": ["KEY_NUMLOCK"], "verrnum": ["KEY_NUMLOCK"], "verr_num": ["KEY_NUMLOCK"],
+
+    # Navigation
+    "home": ["KEY_HOME"], "debut": ["KEY_HOME"],
+    "end": ["KEY_END"], "fin": ["KEY_END"],
+    "pageup": ["KEY_PAGEUP"], "pgup": ["KEY_PAGEUP"], "page_up": ["KEY_PAGEUP"],
+    "pagedown": ["KEY_PAGEDOWN"], "pgdown": ["KEY_PAGEDOWN"], "pgdn": ["KEY_PAGEDOWN"], "page_down": ["KEY_PAGEDOWN"],
+
+    # Direction arrows
+    "up": ["KEY_UP"], "haut": ["KEY_UP"], "fleche_haut": ["KEY_UP"],
+    "down": ["KEY_DOWN"], "bas": ["KEY_DOWN"], "fleche_bas": ["KEY_DOWN"],
+    "left": ["KEY_LEFT"], "gauche": ["KEY_LEFT"], "fleche_gauche": ["KEY_LEFT"],
+    "right": ["KEY_RIGHT"], "droite": ["KEY_RIGHT"], "fleche_droite": ["KEY_RIGHT"],
+    "arrows": ["KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT"],
+    "fleches": ["KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT"],
+    "fleche": ["KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT"],
+    "directionnelles": ["KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT"],
+
+    # ISO 102nd key (< >)
+    "102nd": ["KEY_102ND"], "<": ["KEY_102ND"], ">": ["KEY_102ND"], "chevrons": ["KEY_102ND"],
+
+    # Groups
+    "wasd": ["KEY_W", "KEY_A", "KEY_S", "KEY_D"],
+    "zqsd": ["KEY_Z", "KEY_Q", "KEY_S", "KEY_D"],
+    "fkeys": [f"KEY_F{i}" for i in range(1, 13)],
+    "fonctions": [f"KEY_F{i}" for i in range(1, 13)],
+    "modifiers": ["KEY_LEFTCTRL", "KEY_RIGHTCTRL", "KEY_LEFTALT", "KEY_RIGHTALT", "KEY_LEFTSHIFT", "KEY_RIGHTSHIFT", "KEY_LEFTMETA"],
+    "nav": ["KEY_HOME", "KEY_END", "KEY_PAGEUP", "KEY_PAGEDOWN", "KEY_DELETE", "KEY_BACKSPACE"],
+    "numpad": [
+        "KEY_NUMLOCK", "KEY_KPSLASH", "KEY_KPASTERISK", "KEY_KPMINUS", "KEY_KPPLUS", "KEY_KPENTER", "KEY_KPDOT",
+        "KEY_KP0", "KEY_KP1", "KEY_KP2", "KEY_KP3", "KEY_KP4", "KEY_KP5", "KEY_KP6", "KEY_KP7", "KEY_KP8", "KEY_KP9"
+    ],
+    "pavenum": [
+        "KEY_NUMLOCK", "KEY_KPSLASH", "KEY_KPASTERISK", "KEY_KPMINUS", "KEY_KPPLUS", "KEY_KPENTER", "KEY_KPDOT",
+        "KEY_KP0", "KEY_KP1", "KEY_KP2", "KEY_KP3", "KEY_KP4", "KEY_KP5", "KEY_KP6", "KEY_KP7", "KEY_KP8", "KEY_KP9"
+    ],
+    "digits": [f"KEY_{i}" for i in range(10)],
+    "chiffres": [f"KEY_{i}" for i in range(10)],
+    "nombres": [f"KEY_{i}" for i in range(10)],
+    "lettres": [f"KEY_{c}" for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"],
+    "all": list(EVDEV_TO_LED.keys()),
+}
+
+
+def _strip_accents(s):
+    return unicodedata.normalize('NFKD', s).encode('ASCII', 'ignore').decode('utf-8').lower()
+
+
+def resolve_keys(key_spec):
+    """Resolve comma-separated string or list of key names / aliases into valid evdev keys."""
+    if isinstance(key_spec, str):
+        parts = [p.strip() for p in key_spec.split(",") if p.strip()]
+    else:
+        parts = list(key_spec)
+
+    result = []
+    for part in parts:
+        low = _strip_accents(part)
+        up = part.upper()
+        if low in KEY_ALIASES:
+            for k in KEY_ALIASES[low]:
+                if k in EVDEV_TO_LED and k not in result:
+                    result.append(k)
+        elif up in EVDEV_TO_LED:
+            if up not in result:
+                result.append(up)
+        elif f"KEY_{up}" in EVDEV_TO_LED:
+            k = f"KEY_{up}"
+            if k not in result:
+                result.append(k)
+        elif len(part) == 1:
+            if f"KEY_{up}" in EVDEV_TO_LED:
+                k = f"KEY_{up}"
+                if k not in result:
+                    result.append(k)
+    return result
+
+
 DEFAULT_CONFIG = {
     "backlight": True,
     "flash": True,
@@ -80,8 +183,25 @@ DEFAULT_CONFIG = {
     "brightness": 10,               # 0 to 10 scale for backlight
     "flash_brightness": 10,         # 0 to 10 scale for flash
     "flash_color": [255, 255, 255], # Flash color (white by default)
-    "fade_duration": 0.45           # Duration of flash fade in seconds
+    "fade_duration": 0.45,          # Duration of flash fade in seconds
+    "custom_keys": {}               # { "KEY_ESC": {"color": [255, 0, 0], "brightness": 10}, ... }
 }
+
+
+def compute_key_base_colors(cfg, effective_bg):
+    """Compute base (idle) color for each of the valid LED positions."""
+    custom_keys = cfg.get("custom_keys", {})
+    backlight_on = cfg.get("backlight", True)
+    base_map = {pos: tuple(effective_bg) for pos in VALID_POSITIONS}
+    if not backlight_on:
+        return base_map
+    for kname, cinfo in custom_keys.items():
+        if kname in EVDEV_TO_LED:
+            pos = EVDEV_TO_LED[kname]
+            col = parse_color(cinfo.get("color", [255, 255, 255]), default=[255, 255, 255])
+            br = max(0, min(10, int(cinfo.get("brightness", 10)))) / 10.0
+            base_map[pos] = (int(col[0] * br), int(col[1] * br), int(col[2] * br))
+    return base_map
 
 
 def load_config():
@@ -363,6 +483,9 @@ def run_daemon():
         flash_col = parse_color(cfg.get("flash_color", [255, 255, 255]), default=[255, 255, 255])
         fade_duration = float(cfg.get("fade_duration", 0.45))
 
+        custom_keys = cfg.get("custom_keys", {})
+        has_custom_keys = bool(custom_keys)
+
         # Determine effective background color
         if not backlight_on or b_val == 0:
             effective_bg = [0, 0, 0]
@@ -375,14 +498,16 @@ def run_daemon():
             b_factor = b_val / 10.0
             effective_bg = [int(c * b_factor) for c in raw_bg]
 
-        is_dark = (effective_bg == [0, 0, 0])
-        # Compute flash peak color
-        f_factor = fb_val / 10.0
-        flash_peak = [int(bg + (fl - bg) * f_factor) for bg, fl in zip(effective_bg, flash_col)]
+        # Dark hardware reactive mode is used ONLY if whole keyboard is dark AND (backlight is off OR no custom keys)
+        is_dark = (effective_bg == [0, 0, 0] and (not backlight_on or not has_custom_keys))
 
-        current_state_key = (backlight_on, flash_enabled, b_val, fb_val, tuple(effective_bg), tuple(flash_col))
+        # Compute per-key base colors
+        base_map = compute_key_base_colors(cfg, effective_bg)
+        ck_hash = json.dumps(custom_keys, sort_keys=True)
 
-        # --- CASE 1: Clavier éteint (fond noir) ---
+        current_state_key = (backlight_on, flash_enabled, b_val, fb_val, tuple(effective_bg), tuple(flash_col), ck_hash)
+
+        # --- CASE 1: Clavier éteint (fond noir sans touches personnalisées) ---
         if is_dark:
             hw_color = get_hw_color_code(flash_col)
             use_hw_reactive = (flash_enabled and fb_val > 0)
@@ -406,13 +531,12 @@ def run_daemon():
                     pass
                 continue
 
-        # --- CASE 2: Clavier coloré ---
-        hw_b = max(5, min(50, b_val * 5))
+        # --- CASE 2: Clavier coloré ou touches personnalisées actives ---
+        hw_b = 50
 
         if not flash_enabled or fb_val == 0:
             if current_state_key != last_applied_state:
-                base_frame = {pos: tuple(effective_bg) for pos in VALID_POSITIONS}
-                controller.send_frame(base_frame, hw_brightness=hw_b)
+                controller.send_frame(base_map, hw_brightness=hw_b)
                 last_applied_state = current_state_key
                 active_fades.clear()
 
@@ -424,10 +548,9 @@ def run_daemon():
                 pass
             continue
 
-        # Active reactive flash mode on colored background
+        # Active reactive flash mode on colored/custom background
         if current_state_key != last_applied_state:
-            base_frame = {pos: tuple(effective_bg) for pos in VALID_POSITIONS}
-            controller.send_frame(base_frame, hw_brightness=hw_b)
+            controller.send_frame(base_map, hw_brightness=hw_b)
             last_applied_state = current_state_key
             active_fades.clear()
 
@@ -456,23 +579,26 @@ def run_daemon():
             cur_time = time.time()
             frame_keys = {}
             to_remove = []
+            f_factor = fb_val / 10.0
 
             for pos in VALID_POSITIONS:
+                base_col = base_map.get(pos, tuple(effective_bg))
                 if pos in active_fades:
                     elapsed = cur_time - active_fades[pos]
                     if elapsed >= fade_duration:
                         to_remove.append(pos)
-                        frame_keys[pos] = tuple(effective_bg)
+                        frame_keys[pos] = base_col
                     else:
                         ratio = elapsed / fade_duration
                         # Smoothstep easing for fluid LED fade without stepping
                         factor = 1.0 - (3.0 * ratio * ratio - 2.0 * ratio * ratio * ratio)
-                        r = int(flash_peak[0] * factor + effective_bg[0] * (1.0 - factor))
-                        g = int(flash_peak[1] * factor + effective_bg[1] * (1.0 - factor))
-                        b = int(flash_peak[2] * factor + effective_bg[2] * (1.0 - factor))
+                        peak_col = [int(bc + (fl - bc) * f_factor) for bc, fl in zip(base_col, flash_col)]
+                        r = int(peak_col[0] * factor + base_col[0] * (1.0 - factor))
+                        g = int(peak_col[1] * factor + base_col[1] * (1.0 - factor))
+                        b = int(peak_col[2] * factor + base_col[2] * (1.0 - factor))
                         frame_keys[pos] = (r, g, b)
                 else:
-                    frame_keys[pos] = tuple(effective_bg)
+                    frame_keys[pos] = base_col
 
             for p in to_remove:
                 del active_fades[p]

@@ -62,6 +62,34 @@ aorus rgb flash brightness <0-10> # Intensité du flash (ex: aorus rgb flash bri
 aorus rgb flash color <couleur>   # Couleur du flash (ex: white, green, yellow, purple, #ffffff)
 ```
 
+### Coloration par touche (Per-Key RGB fixe)
+Permet d'assigner une couleur et une intensité fixes à des touches spécifiques en superposition de la couleur globale :
+
+```bash
+# Couleur et luminosité combinées (<couleur>:<luminosité> ou <couleur> <luminosité>)
+aorus rgb key super,ctrl,alt,shift red:10
+aorus rgb key echap,return,suppre,backspace cyan:8
+aorus rgb key wasd yellow 10
+aorus rgb key fleches orange:9
+
+# Groupes prédéfinis
+aorus rgb key modifiers red:10      # super, ctrl, alt, shift
+aorus rgb key nav cyan:8            # debut, fin, pageup, pagedown, suppr, retour
+aorus rgb key fkeys blue:6          # f1 à f12
+aorus rgb key numpad purple:7       # pavé numérique complet
+aorus rgb key digits green:10       # chiffres 0 à 9
+
+# Réinitialiser des touches (retour à la couleur globale)
+aorus rgb key wasd reset
+aorus rgb key super,ctrl reset
+
+# Lister ou tout réinitialiser
+aorus rgb key list                  # Affiche les touches personnalisées actives
+aorus rgb key clear                 # Efface toutes les personnalisations par touche
+```
+
+> **Aliases disponibles (français & anglais)** : `super`, `win`, `ctrl`, `alt`, `shift`, `maj`, `echap`, `escape`, `return`, `entree`, `suppre`, `suppr`, `delete`, `backspace`, `retour`, `tab`, `space`, `espace`, `fleches`, `arrows`, `haut`, `bas`, `gauche`, `droite`, `wasd`, `zqsd`, `fkeys`, `modifiers`, `nav`, `numpad`, `digits`...
+
 ### Gestion du service
 ```bash
 aorus rgb restart                 # Redémarre le démon en tâche de fond
