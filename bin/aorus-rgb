@@ -80,7 +80,8 @@ def fmt_workspace(cfg, light, workspace):
         return RED + "Activé, mais Hyprland injoignable" + RESET
     if light.ws_pos is None:
         return DIM + f"Workspace {workspace} (masqué : clavier éteint)" + RESET
-    return GREEN + f"Workspace {workspace} à {fmt_brightness(cfg.get('workspace_brightness', 10))}" + RESET
+    return GREEN + (f"Workspace {workspace} : {fmt_color(cfg.get('workspace_color'))} "
+                    f"({fmt_brightness(cfg.get('workspace_brightness', 10))})") + RESET
 
 
 def cmd_on():
@@ -365,6 +366,26 @@ def cmd_preset(args):
 
 # ----------------- WORKSPACE INDICATOR -----------------
 
+def cmd_workspace_color(color_str):
+    col = parse_color_arg(color_str)
+    if col is None:
+        print(f"Erreur: Couleur '{color_str}' non reconnue.")
+        print("Exemples: inherit, white, cyan, theme, 028391, '#ffffff'")
+        return
+    desc = "INHERIT (garde la couleur de la touche)" if col == "inherit" else str(col)
+    apply({"workspace_color": col, "workspace_key": True},
+          f"✓ Couleur du workspace actif réglée sur {desc}.")
+
+
+def cmd_workspace_brightness(val_str):
+    val = parse_brightness_arg(val_str)
+    if not isinstance(val, int):
+        print("Usage: aorus rgb workspace brightness <0-10>")
+        return
+    apply({"workspace_brightness": val, "workspace_key": True},
+          f"✓ Intensité du workspace actif réglée à {val}/10.")
+
+
 def cmd_workspace(args):
     """Highlight the digit key of the active Hyprland workspace."""
     cfg = load_config()
@@ -378,15 +399,17 @@ def cmd_workspace(args):
         state = not cfg.get("workspace_dark") if len(args) < 2 else args[1].lower() == "on"
         apply({"workspace_dark": state},
               f"✓ Indicateur sur clavier éteint {'ACTIVÉ (coûte le mode 0 % CPU)' if state else 'DÉSACTIVÉ'}.")
+    elif sub == "color":
+        needs_arg("workspace color <inherit|cyan|theme|#hex>", cmd_workspace_color, args[1:])
     elif sub in ("brightness", "intensity"):
-        val = parse_brightness_arg(args[1]) if len(args) > 1 else None
-        if not isinstance(val, int):
-            print("Usage: aorus rgb workspace brightness <0-10>")
-            return
-        apply({"workspace_brightness": val, "workspace_key": True},
-              f"✓ Intensité du workspace actif réglée à {val}/10.")
+        needs_arg("workspace brightness <0-10>", cmd_workspace_brightness, args[1:])
+    elif isinstance(parse_brightness_arg(sub), int):
+        cmd_workspace_brightness(sub)      # `aorus rgb workspace 8`
+    elif parse_color_arg(sub) is not None:
+        cmd_workspace_color(sub)           # `aorus rgb workspace cyan`
     else:
         print("Usage: aorus rgb workspace on | off | toggle")
+        print("       aorus rgb workspace color <couleur|inherit>")
         print("       aorus rgb workspace brightness <0-10>")
         print("       aorus rgb workspace dark [on|off]")
 
@@ -406,6 +429,7 @@ Commandes disponibles :
   aorus rgb preset list
   aorus rgb <nom-de-preset>              - Charge un preset
   aorus rgb workspace on | off           - Éclaire le chiffre du workspace actif
+  aorus rgb workspace color <couleur|inherit>
   aorus rgb workspace brightness <0-10> | dark [on|off]
   aorus rgb status | restart
 

@@ -158,7 +158,8 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
 - La signature vient de `HYPRLAND_INSTANCE_SIGNATURE` quand systemd l'a importée (c'est le cas sous uwsm), sinon du répertoire d'instance le plus récent : un service utilisateur n'hérite pas toujours de l'environnement du compositeur.
 - Événements pris en compte : `workspace>>`, `workspacev2>>` et `focusedmon>>`. Le watcher se reconnecte tout seul si Hyprland redémarre, et reste inerte hors Hyprland.
 - `workspace_led_pos()` fait correspondre le **nom** du workspace à la touche chiffre : `3` → `KEY_3`, et `10` → `KEY_0`, parce que le binding Omarchy est `SUPER + code:N` sur `1..9` puis `0`. Un workspace nommé (`Work`) n'allume rien.
-- L'indicateur **ne modifie que l'intensité** : la touche garde la couleur que la cascade lui a résolue. Il n'est jamais écrit dans `custom_keys` — c'est un étage calculé au rendu, sinon les presets et la config se pollueraient à chaque bascule.
+- L'indicateur se règle comme le flash : `workspace_color` et `workspace_brightness` écrasent chacun la cascade, ou la laissent passer sur `inherit`. Par défaut `workspace_color` vaut `inherit`, donc la touche garde sa couleur et ne fait que monter en intensité. Une couleur explicite écrase aussi une touche personnalisée — c'est l'étage le plus haut.
+- Il n'est jamais écrit dans `custom_keys` : c'est un étage calculé au rendu, sinon les presets et la config se pollueraient à chaque bascule.
 - Sur un clavier éteint, l'indicateur est **abandonné** pour préserver le mode matériel à 0 % CPU, sauf si `workspace_dark` est vrai : cette option assume explicitement le passage en mode matrice.
 
 ---

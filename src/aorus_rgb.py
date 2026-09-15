@@ -186,6 +186,7 @@ DEFAULT_CONFIG = {
     "fade_duration": 0.45,          # Duration of flash fade in seconds
     "custom_keys": {},              # { "KEY_ESC": {"color": [255, 0, 0], "brightness": 10}, ... }
     "workspace_key": False,         # Light the digit key of the active Hyprland workspace
+    "workspace_color": "inherit",   # Color of that digit, or inherit to keep the cascade's
     "workspace_brightness": 10,     # Brightness of that digit, 0 to 10
     "workspace_dark": False,        # Show it on an unlit keyboard too, at the cost of the 0% CPU mode
 }
@@ -239,8 +240,9 @@ def resolve_key_settings(cfg, raw_bg, global_b, ws_pos=None):
     Brightness stays on the 0-10 scale rather than being pre-multiplied, so that
     the flash can inherit it in turn. Returns {pos: (raw_color, brightness)}.
 
-    `ws_pos`, the active workspace digit, sits above the custom keys: it keeps
-    the color the cascade resolved and only raises the brightness.
+    `ws_pos`, the active workspace digit, sits above the custom keys: like the
+    flash, each of its two settings either overrides the cascade or inherits
+    what the cascade resolved for that key.
     """
     raw_bg = tuple(raw_bg)
     settings = {pos: (raw_bg, global_b) for pos in VALID_POSITIONS}
@@ -254,7 +256,8 @@ def resolve_key_settings(cfg, raw_bg, global_b, ws_pos=None):
                          resolve_brightness(cinfo.get("brightness"), global_b))
 
     if ws_pos in settings:
-        settings[ws_pos] = (settings[ws_pos][0],
+        ws_color = parse_color(cfg.get("workspace_color"), default=None)
+        settings[ws_pos] = (tuple(ws_color) if ws_color is not None else settings[ws_pos][0],
                             resolve_brightness(cfg.get("workspace_brightness"), 10))
     return settings
 

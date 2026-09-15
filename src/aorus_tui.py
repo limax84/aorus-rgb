@@ -337,6 +337,7 @@ def screen_os(console):
         found = c.workspace or "Hyprland injoignable"
         return [
             ("Indicateur workspace", "activé" if c.cfg.get("workspace_key") else "désactivé", toggle),
+            ("Couleur du chiffre", fmt_color(c.cfg.get("workspace_color")), set_color),
             ("Intensité du chiffre", fmt_brightness(c.cfg.get("workspace_brightness", 10)), set_brightness),
             ("Sur clavier éteint", "oui (coûte le 0 % CPU)" if c.cfg.get("workspace_dark") else "non", toggle_dark),
             ("Workspace actif", found, refresh),
@@ -357,6 +358,12 @@ def screen_os(console):
         c.commit({"workspace_dark": state},
                  "Visible clavier éteint." if state else "Masqué clavier éteint.")
 
+    def set_color(c):
+        color = ask_color(c, "Couleur du workspace actif (nom, #hex, inherit) : ")
+        if color is not None:
+            c.commit({"workspace_color": color, "workspace_key": True},
+                     f"Workspace actif : {fmt_color(color)}")
+
     def set_brightness(c):
         value = ask_brightness(c, "Intensité du workspace actif (0-10) : ")
         if isinstance(value, int):
@@ -368,7 +375,7 @@ def screen_os(console):
         c.message = "Service redémarré."
 
     console.menu("Intégration OS", rows,
-                 "La touche du chiffre du workspace actif garde sa couleur et monte en intensité.")
+                 "Couleur et intensité du chiffre du workspace actif ; « inherit » garde celle de la touche.")
 
 
 def screen_presets(console):

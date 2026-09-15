@@ -71,7 +71,24 @@ def test_workspace():
           A.resolve_lighting(cfg, "3").base_map[pos("KEY_4")] == (0, 44, 51))
     colored = A.resolve_lighting(
         dict(cfg, custom_keys={"KEY_3": {"color": [255, 0, 0], "brightness": 1}}), "3")
-    check("l'indicateur ne change que l'intensité", colored.base_map[pos("KEY_3")] == (255, 0, 0))
+    check("par défaut l'indicateur hérite de la couleur de la touche",
+          colored.base_map[pos("KEY_3")] == (255, 0, 0))
+
+    forced_color = dict(cfg, workspace_color=[255, 255, 255])
+    check("une couleur explicite écrase la cascade",
+          A.resolve_lighting(forced_color, "3").base_map[pos("KEY_3")] == (255, 255, 255))
+    check("elle écrase aussi une touche personnalisée",
+          A.resolve_lighting(dict(forced_color,
+                                  custom_keys={"KEY_3": {"color": [255, 0, 0], "brightness": 1}}),
+                             "3").base_map[pos("KEY_3")] == (255, 255, 255))
+    check("elle est atténuée par l'intensité du workspace",
+          A.resolve_lighting(dict(forced_color, workspace_brightness=5),
+                             "3").base_map[pos("KEY_3")] == (127, 127, 127))
+    check("elle ne touche pas les autres chiffres",
+          A.resolve_lighting(forced_color, "3").base_map[pos("KEY_4")] == (0, 44, 51))
+    check("une couleur illisible retombe sur la cascade",
+          A.resolve_lighting(dict(cfg, workspace_color="pas-une-couleur"),
+                             "3").base_map[pos("KEY_3")] == (0, 220, 255))
     check("le workspace 10 vise la touche 0", A.resolve_lighting(cfg, "10").ws_pos == pos("KEY_0"))
     check("un workspace nommé n'allume rien", A.resolve_lighting(cfg, "Work").ws_pos is None)
     check("désactivé, aucun effet",

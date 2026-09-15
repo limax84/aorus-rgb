@@ -13,7 +13,7 @@ Contrôleur de rétroéclairage et effet réactif touche-par-touche pour ordinat
 - ⚡ **Flash réactif** : la touche frappée s'illumine puis revient en fondu vers sa couleur de repos.
 - 🧬 **Héritage en cascade** : clavier → touche → flash. Ce qu'on laisse en `inherit` suit le niveau au-dessus, donc un flash hérité prend la couleur *de la touche frappée*.
 - 💾 **Presets** : configurations complètes enregistrées et rappelées par un nom.
-- 🪟 **Indicateur de workspace** : sous Hyprland, la touche chiffre du workspace actif passe à pleine intensité.
+- 🪟 **Indicateur de workspace** : sous Hyprland, la touche chiffre du workspace actif ressort, avec sa propre couleur et intensité.
 - 🚀 **Zéro CPU en fond noir** : bascule automatique sur le mode réactif matériel (1000 Hz, 0 % CPU, aucun paquet USB) quand le clavier est éteint.
 - 🌊 **Fondu sans clignotement** : interpolation *smoothstep* calibrée sur la bande passante du contrôleur (~93 ms par trame).
 - 🔄 **Rechargement instantané** : le démon recharge ses réglages en moins d'une milliseconde, sans redémarrage.
@@ -127,8 +127,9 @@ clavier (bg_color + brightness)
           └─> flash (flash_color + flash_brightness)
 ```
 
-L'indicateur de workspace se greffe par-dessus la touche personnalisée, mais ne
-touche que l'intensité : la couleur continue de descendre par la cascade.
+L'indicateur de workspace se greffe au-dessus de la touche personnalisée, avec
+les mêmes règles : `workspace_color` et `workspace_brightness` écrasent, ou
+héritent de ce que la touche avait résolu.
 
 ```bash
 aorus rgb key wasd red:10         # Rouge, intensité 10 : rien n'est hérité
@@ -157,15 +158,24 @@ aorus rgb preset delete gaming
 
 ### Indicateur de workspace (Hyprland)
 
-La touche du chiffre correspondant au workspace actif passe à pleine intensité —
-le même chiffre que `Super + N`. Elle **garde sa couleur** : seule l'intensité
-change, donc la personnalisation des chiffres est préservée.
+La touche du chiffre correspondant au workspace actif ressort du lot — le même
+chiffre que `Super + N`. Couleur et intensité se règlent comme celles du flash,
+et `inherit` laisse passer ce que la cascade avait résolu pour cette touche.
 
 ```bash
 aorus rgb workspace on | off | toggle
+aorus rgb workspace color white     # Couleur de la touche active, ou "inherit"
 aorus rgb workspace brightness 10   # Intensité de la touche active
 aorus rgb workspace dark on         # Montrer l'indicateur même clavier éteint
+
+aorus rgb workspace cyan            # Raccourcis : une couleur ou une intensité
+aorus rgb workspace 8               # se passent du sous-mot
 ```
+
+Par défaut `workspace color` vaut `inherit` : le chiffre actif garde sa couleur
+et ne fait que monter en intensité, donc la personnalisation des chiffres est
+préservée. Une couleur explicite prend le dessus sur tout, y compris sur une
+touche personnalisée — c'est l'étage le plus haut de la cascade.
 
 > Par défaut, un clavier éteint reste en mode matériel (0 % CPU) et l'indicateur
 > est masqué. `workspace dark on` l'affiche quand même, au prix du passage en
