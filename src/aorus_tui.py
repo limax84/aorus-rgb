@@ -136,6 +136,7 @@ class Console:
         self.palette = Palette()
         self.history = []       # config snapshots, for undo
         self.message = ""
+        self.body_rows = 1      # content rows inside the frame, set by frame()
         self.workspace = active_workspace()
 
     # --- config plumbing -------------------------------------------------
@@ -215,11 +216,16 @@ class Console:
             self.write(y, width - 1, VBAR, chrome)
         self.write(height - 1, 0, BL + HBAR * inner + BR, chrome)
 
-        # Footer band: separator, message line, key hints.
-        self.write(height - 4, 0, LTEE + HBAR * inner + RTEE, chrome)
+        # Footer band: separator, key hints, border -- plus a message line, but
+        # only while there is a message. An always-reserved slot would leave a
+        # blank line hanging above the hints most of the time.
+        band = height - (4 if self.message else 3)
+        self.write(band, 0, LTEE + HBAR * inner + RTEE, chrome)
         if subtitle:
             self.write(1, 2, subtitle[:inner - 2], self.palette.pair(MUTED))
-        return (3 if subtitle else 2), inner
+        top = 3 if subtitle else 2
+        self.body_rows = max(1, band - top)
+        return top, inner
 
     def footer(self, hints, status=""):
         """Draw the key hints and the last message inside the frame.
@@ -396,8 +402,7 @@ def screen_help(console):
     offset = 0
     while True:
         top, inner = console.frame("Manuel")
-        height = console.scr.getmaxyx()[0]
-        page = max(1, height - 4 - top)
+        page = console.body_rows
         offset = max(0, min(offset, len(MANUAL) - page))
 
         for i, (style, text) in enumerate(MANUAL[offset:offset + page]):
