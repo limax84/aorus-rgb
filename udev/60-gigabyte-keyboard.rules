@@ -7,6 +7,12 @@
 #
 # Matching is narrowed to the lighting controller's own vendor:product so that
 # nothing else on the bus is touched.
+#
+# The 60- prefix is load-bearing. systemd applies the tag from
+# 73-seat-late.rules, and udev evaluates rule files in filename order: a tag
+# added by a 99- file is set after 73 has already decided not to schedule the
+# builtin, so it does nothing at all. Every uaccess rule systemd ships is
+# numbered below 73 for this reason.
 
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0414", ATTRS{idProduct}=="8007", TAG+="uaccess"
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="0414", ATTRS{idProduct}=="8007", TAG+="uaccess"

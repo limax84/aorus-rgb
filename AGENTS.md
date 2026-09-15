@@ -49,6 +49,7 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
     `[0x00, 0x08, 0x00, 0x33, 0x01, hw_brightness, 0x05, 0x01, checksum]`
   - `hw_brightness` : `5` à `50` (échelle 0-10 mappée sur `val * 5`).
   - **ATTENTION (Crucial)** : Ne JAMAIS réenvoyer ce paquet `0x33` à chaque trame d'animation ! S'il est renvoyé à chaque trame, le microcontrôleur réinitialise son moteur d'éclairage, ce qui crée un clignotement / bégaiement violent.
+  - Corollaire : sur échec d'écriture en plein milieu des 8 blocs, `send_frame()` **ne rejoue pas** le `0x33` ni le flux. Le MCU peut encore attendre les blocs manquants et lirait l'en-tête neuf comme leur fin, décalant toutes les trames suivantes. On signale l'échec, la boucle renvoie une trame entière au tour d'après.
 - **Envoi des couleurs de touches (Rapport 0x12)** :
   1. Envoi d'un Feature Report d'en-tête :
      `[0x00, 0x12, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0xE5]`
@@ -72,12 +73,14 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 
 ## 3. Permissions du périphérique (udev)
 
-`udev/99-gigabyte-keyboard.rules` accorde l'accès via **`TAG+="uaccess"`**, qui pose une ACL pour l'utilisateur de la session locale active, et restreint la correspondance au `0414:8007`.
+`udev/60-gigabyte-keyboard.rules` accorde l'accès via **`TAG+="uaccess"`**, qui pose une ACL pour l'utilisateur de la session locale active, et restreint la correspondance au `0414:8007`.
 
+- **Le préfixe `60-` est porteur.** systemd applique le tag depuis `73-seat-late.rules`, et udev évalue les fichiers dans l'ordre des noms : un `TAG+="uaccess"` posé par un fichier `99-` arrive après que la règle 73 a décidé de ne pas planifier le builtin, et ne fait donc **rien du tout**. Toutes les règles `uaccess` livrées par systemd sont numérotées sous 73.
 - **Ne jamais revenir à `MODE="0666"`.** C'est ce que faisait la règle d'origine, et `ATTRS{idVendor}=="0414"` seul l'appliquait à tous les nœuds du fabricant : le `event*` du clavier devenait lisible par **n'importe quel processus local**, ce qui est un enregistreur de frappe offert à toute application de la machine.
 - Le groupe `input` suffit sur les distributions qui y placent l'utilisateur, mais pas partout ; `uaccess` marche dans les deux cas sans rien exposer.
 - `install.sh` **compare** la règle en place à celle du dépôt et la remplace si elle diffère. Il ne faut pas revenir à un simple test de présence : les installations existantes garderaient éternellement l'ancienne règle, correctif de sécurité compris.
-- La règle est le seul fichier hors du répertoire utilisateur, et `uninstall.sh` la retire.
+- `install.sh` **supprime aussi l'ancien `99-gigabyte-keyboard.rules`** (`LEGACY_UDEV_RULE`) : le laisser en place continuerait d'accorder `MODE="0666"` quoi que dise la nouvelle règle. `hardware_checks()` le signale tant qu'il existe.
+- La règle est le seul fichier hors du répertoire utilisateur, et `uninstall.sh` retire les deux.
 - `hardware_checks()` est la source unique du diagnostic (`aorus rgb doctor`, fin d'`install.sh`) : matériel présent, contrôleur ouvrable, clavier lisible, règle à jour, service actif.
 
 ---
@@ -136,7 +139,7 @@ Règles de découpage à respecter :
 
 ## 6. Héritage en cascade (`inherit`)
 
-Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau reprend la valeur du niveau au-dessus pour chaque champ laissé en `inherit`. L'indicateur de workspace se greffe au-dessus des touches personnalisées, mais ne touche que l'intensité (§ 7).
+Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau reprend la valeur du niveau au-dessus pour chaque champ laissé en `inherit`. L'indicateur de workspace se greffe au-dessus des touches personnalisées, avec les mêmes règles pour sa couleur comme pour son intensité (§ 8).
 
 - `is_inherit(val)` est le point de vérité unique : `True` pour `None` et pour les chaînes `inherit`, `auto`, `clavier`, `kbl`, `null`, `default` et la chaîne vide.
 - **`none` en est volontairement exclu** : c'est l'alias historique de *noir* dans `NAMED_COLORS` (`aorus rgb color none` éteint le fond). Ne pas le réintroduire dans `is_inherit()` sans traiter la régression sur `cmd_color`.
@@ -152,7 +155,7 @@ Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau r
 
 Le flash est donc résolu **par touche**, jamais globalement. Les champs `Lighting.hw_flash_color` et `Lighting.flash_brightness` ne servent qu'au mode matériel `0x04`, monochrome par construction, et au test d'activation du flash.
 
-La boucle ne réémet une trame que lorsque son *empreinte* change : `(config sérialisée, workspace actif, mtime du thème)`. Le mtime du thème n'est calculé que si `bg_color` vaut littéralement `"theme"` — c'est ce qui rend `aorus rgb color theme` réellement dynamique au lieu de figer l'accent du jour où la commande a été tapée.
+La boucle ne réémet une trame que lorsque **le rendu change**, pas ses entrées : elle compare `(is_dark, flash, flash_brightness, hw_flash_color, base_map)`. Une bascule de workspace sur un clavier noir ne produit donc aucun paquet, alors qu'une comparaison des entrées la ferait passer pour un changement. `Lighting.flash_active` dit si une frappe montrerait quoi que ce soit, jugé **par touche** : une intensité de flash héritée se résout globalement à 0 sur un clavier sombre alors que des touches gardent un pic bien réel.
 
 Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque touche à sa propre intensité de repos — sans effet visible sur une touche déjà à 10/10. Le réglage utile est `flash_color: "inherit"` avec `flash_brightness: 10`.
 
@@ -171,6 +174,8 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
 - `wait_events()` est l'unique `select()` : périphérique evdev, socket d'événements Hyprland et self-pipe des signaux y sont attendus ensemble. Il renvoie `None` quand le clavier a disparu, et la boucle le rouvre après `DEVICE_RETRY_DELAY` au lieu de mourir dans une boucle de redémarrage systemd.
 - **Reprise de veille** : une itération plus longue que `SUSPEND_GAP` signifie qu'on sort de suspension. Le contrôleur est reconnecté et l'empreinte remise à `None`, ce qui force le réenvoi d'une trame — sans cela le clavier restait sur l'état que le MCU avait perdu.
 - Les constantes de la boucle (`CONFIG_POLL_INTERVAL`, `IDLE_TIMEOUT`, `FADE_TIMEOUT`, `MIN_RETRIGGER_DELAY`, `HW_FULL_BRIGHTNESS`, `SUSPEND_GAP`, `DEVICE_RETRY_DELAY`) sont regroupées en tête de `src/aorus_rgb.py`.
+- `get_theme_accent_color()` est mémoïsé sur le mtime du fichier : `resolve_lighting()` l'appelle une fois par touche qui suit le thème, et rouvrir le fichier cent fois par trame ne servait à rien.
+- `theme_stamp(cfg)` teste les valeurs réellement rendues (fond, couleur sauvegardée, flash, workspace, touches), pas la présence du mot dans la config sérialisée : ce reniflage ratait les variantes de casse.
 - `resolve_fade_duration()` plancher à 0,05 s : une `fade_duration` à zéro dans la config divisait par zéro en plein fondu.
 
 ---

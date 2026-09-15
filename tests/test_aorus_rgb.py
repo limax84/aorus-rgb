@@ -54,6 +54,26 @@ def test_inheritance():
           all(A.is_inherit(v) for v in (None, "inherit", "auto", "null", "")))
 
 
+def test_flash_activity():
+    print("activité du flash")
+    base = copy.deepcopy(A.DEFAULT_CONFIG)
+    # Intensité globale 0 mais une touche à 10 : le flash a bel et bien
+    # quelque chose à montrer, la jauger globalement l'éteignait.
+    cfg = dict(base, backlight=True, brightness=0, flash=True,
+               flash_color=[255, 255, 255], flash_brightness="inherit",
+               custom_keys={"KEY_A": {"color": [255, 0, 0], "brightness": 10}})
+    light = A.resolve_lighting(cfg)
+    check("le flash reste actif si une touche peut flasher", light.flash_active,
+          f"flash_brightness global = {light.flash_brightness}")
+    check("et la touche a bien un pic distinct de son repos",
+          light.flash_map[pos("KEY_A")] != light.base_map[pos("KEY_A")])
+    check("flash désactivé reste inactif",
+          not A.resolve_lighting(dict(cfg, flash=False)).flash_active)
+    check("un flash qui ne change rien est inactif",
+          not A.resolve_lighting(dict(base, flash=True, flash_color="inherit",
+                                      flash_brightness="inherit")).flash_active)
+
+
 def test_fade_duration():
     print("durée de fondu")
     base = copy.deepcopy(A.DEFAULT_CONFIG)
@@ -122,15 +142,18 @@ def test_theme():
         return
     check("bg_color 'theme' se résout au rendu",
           A.resolve_lighting(dict(base, bg_color="theme")).raw_bg == A.get_theme_accent_color())
-    check("l'empreinte suit le thème",
-          A.theme_stamp(json.dumps(dict(base, bg_color="theme"))) != "")
+    check("l'empreinte suit le thème", A.theme_stamp(dict(base, bg_color="theme")) != "")
     # Le fond n'est pas le seul réglage qui peut valoir "theme".
     check("l'empreinte couvre aussi le flash",
-          A.theme_stamp(json.dumps(dict(base, flash_color="theme"))) != "")
+          A.theme_stamp(dict(base, flash_color="theme")) != "")
+    check("l'empreinte couvre aussi le workspace",
+          A.theme_stamp(dict(base, workspace_color="theme")) != "")
     check("l'empreinte couvre aussi une touche personnalisée",
-          A.theme_stamp(json.dumps(dict(base, custom_keys={"KEY_A": {"color": "theme"}}))) != "")
+          A.theme_stamp(dict(base, custom_keys={"KEY_A": {"color": "theme"}})) != "")
+    check("l'empreinte tolère les variantes de casse",
+          A.theme_stamp(dict(base, bg_color=" Theme ")) != "")
     check("l'empreinte est vide sans aucun 'theme'",
-          A.theme_stamp(json.dumps(dict(base, bg_color=[1, 2, 3]))) == "")
+          A.theme_stamp(dict(base, bg_color=[1, 2, 3])) == "")
 
 
 def test_hostile_config():
@@ -282,6 +305,41 @@ def test_device_access():
           A.find_lighting_path.__doc__ and "None" in A.find_lighting_path.__doc__)
 
 
+def test_console_edits():
+    print("édition depuis la console")
+    import aorus_tui as T
+    directory = tempfile.mkdtemp()
+    A.CONFIG_DIR, A.CONFIG_FILE = directory, os.path.join(directory, "config.json")
+    T.load_config, T.update_config = A.load_config, A.update_config
+    T.notify_daemon = lambda: None
+    A.save_config(dict(copy.deepcopy(A.DEFAULT_CONFIG), bg_color=[0, 220, 255],
+                       custom_keys={"KEY_A": {"color": [1, 1, 1], "brightness": 2},
+                                    "KEY_Z": {"color": [9, 9, 9], "brightness": 9}}))
+    console = T.Console.__new__(T.Console)
+    console.cfg, console.history, console.message = A.load_config(), [], ""
+
+    # Appliquer une couleur recopiait l'intensité de la première touche marquée
+    # sur toutes les autres, et inversement.
+    console.set_keys(["KEY_A", "KEY_Z"], color=[0, 255, 0])
+    keys = A.load_config()["custom_keys"]
+    check("une couleur multiple garde l'intensité de chaque touche",
+          (keys["KEY_A"]["brightness"], keys["KEY_Z"]["brightness"]) == (2, 9),
+          (keys["KEY_A"]["brightness"], keys["KEY_Z"]["brightness"]))
+    console.set_keys(["KEY_A", "KEY_Z"], brightness=5)
+    keys = A.load_config()["custom_keys"]
+    check("une intensité multiple garde la couleur de chaque touche",
+          keys["KEY_A"]["color"] == keys["KEY_Z"]["color"] == [0, 255, 0])
+
+    # undo réécrivait toute la config en mémoire, effaçant les écritures CLI.
+    console.commit({"brightness": 3}, "")
+    A.update_config({"bg_color": [255, 0, 0]})
+    console.cfg = A.load_config()
+    console.undo()
+    after = A.load_config()
+    check("undo ne touche que le champ modifié", after["brightness"] == 10, after["brightness"])
+    check("et laisse passer une écriture concurrente", after["bg_color"] == [255, 0, 0])
+
+
 def test_controller_failure():
     print("clavier absent")
 
@@ -389,8 +447,13 @@ def test_reload_latency():
 
         # Une bascule de workspace ne doit rien réémettre quand l'indicateur est
         # éteint : sinon elle coupe le fondu en cours et ré-arme le mode matériel.
+        # Idem quand il est allumé mais que le rendu est identique (clavier noir).
         for enabled, expected in ((False, 0), (True, 3)):
-            A.save_config(dict(A.load_config(), workspace_key=enabled))
+            # brightness 3 face à workspace_brightness 10 : le chiffre actif
+            # ressort vraiment. À 10/10 partout, surligner ne changerait rien
+            # et ne rien envoyer serait le bon comportement.
+            A.save_config(dict(A.load_config(), workspace_key=enabled, brightness=3,
+                               backlight=True, bg_color=[0, 220, 255]))
             os.kill(daemon.pid, signal.SIGUSR1)
             next_frame(1.0)
             frames = 0
@@ -401,14 +464,28 @@ def test_reload_latency():
                     frames += 1
             check(f"workspace_key={enabled} : {frames} trame(s) sur 3 bascules",
                   frames == expected, f"attendu {expected}")
+
+        # Clavier éteint, indicateur allumé mais masqué : le rendu ne bouge pas,
+        # donc aucun paquet ne doit partir — c'est la propriété « 0 paquet USB ».
+        A.save_config(dict(A.load_config(), workspace_key=True, backlight=False))
+        os.kill(daemon.pid, signal.SIGUSR1)
+        next_frame(1.0)
+        dark_frames = 0
+        for name in ("5", "6", "7"):
+            with open(os.path.join(directory, "workspace"), "w") as f:
+                f.write(name)
+            if next_frame(1.0) is not None:
+                dark_frames += 1
+        check(f"clavier éteint : {dark_frames} trame(s) sur 3 bascules", dark_frames == 0)
     finally:
         daemon.kill()
         daemon.wait()
 
 
 def main():
-    for test in (test_inheritance, test_fade_duration, test_workspace, test_theme,
-                 test_workspace_events, test_device_access, test_controller_failure,
+    for test in (test_inheritance, test_flash_activity, test_fade_duration, test_workspace, test_theme,
+                 test_workspace_events, test_device_access, test_console_edits,
+                 test_controller_failure,
                  test_reload_latency,
                  test_hostile_config, test_config_store):
         test()

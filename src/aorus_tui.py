@@ -8,12 +8,14 @@ so the keyboard under your hands is the preview. Standard library only: curses.
 
 import curses
 import locale
+import time
 
 from aorus_rgb import (
     EVDEV_TO_LED, PRESET_KEYS, active_workspace, delete_preset, describe_preset,
     fmt_brightness, fmt_color, is_service_active, list_presets, load_config,
-    notify_daemon, parse_brightness_arg, parse_color_arg, preset_exists,
-    read_preset, resolve_keys, resolve_lighting, restart_service, save_config,
+    ConfigUnreadable, get_theme_accent_color, is_lit, notify_daemon, parse_brightness_arg,
+    parse_color, parse_color_arg, preset_exists, resolve_brightness,
+    read_preset, resolve_keys, resolve_lighting, restart_service,
     update_config, write_preset,
 )
 
@@ -65,6 +67,7 @@ LAYOUT_WIDTH = max(len([c for c in row if c]) * CELL + CELL // 2
                    for row in KEYBOARD_ROWS)                # widest row, gap included
 MIN_WIDTH = LAYOUT_WIDTH + 4                                # plus the frame and its margins
 MIN_HEIGHT = len(KEYBOARD_ROWS) + 11                        # rows, title, status and footer band
+SERVICE_POLL_INTERVAL = 3.0                                 # seconds between systemctl forks
 
 # Groups offered by the `g` shortcut on the keyboard map.
 GROUPS = ["wasd", "zqsd", "fkeys", "modifiers", "nav", "numpad", "digits",
@@ -92,10 +95,17 @@ class Palette:
     def __init__(self):
         self.pairs = {}
         self.next_pair = 1
-        self.enabled = curses.has_colors()
-        if self.enabled:
-            curses.start_color()
-            curses.use_default_colors()
+        # Les index employés (chrome et cube 256) dépassent les 8 couleurs de
+        # TERM=xterm, linux ou screen : init_pair y lève ValueError, que
+        # curses.wrapper ne rattrape pas. On se rabat alors sur le monochrome.
+        self.enabled = False
+        try:
+            if curses.has_colors():
+                curses.start_color()
+                curses.use_default_colors()
+                self.enabled = curses.COLORS >= 256
+        except (curses.error, ValueError):
+            pass
 
     @staticmethod
     def to_256(rgb):
@@ -113,7 +123,10 @@ class Palette:
         if index not in self.pairs:
             if self.next_pair >= min(curses.COLOR_PAIRS, 256):
                 return curses.A_NORMAL
-            curses.init_pair(self.next_pair, index, -1)
+            try:
+                curses.init_pair(self.next_pair, index, -1)
+            except (curses.error, ValueError):
+                return curses.A_NORMAL
             self.pairs[index] = curses.color_pair(self.next_pair)
             self.next_pair += 1
         return self.pairs[index]
@@ -137,6 +150,7 @@ class Console:
         self.history = []       # config snapshots, for undo
         self.message = ""
         self.body_rows = 1      # content rows inside the frame, set by frame()
+        self._service_ok, self._service_checked = is_service_active(), time.monotonic()
         self.workspace = active_workspace()
 
     # --- config plumbing -------------------------------------------------
@@ -146,11 +160,17 @@ class Console:
 
         Only the changed fields are written, on top of the config as it is on
         disk right now: the CLI may have written since this console loaded, and
-        saving our whole in-memory copy would silently undo it.
+        saving our whole in-memory copy would silently undo it. The undo entry
+        is narrowed the same way, for the same reason.
         """
-        self.history.append(dict(self.cfg))
+        self.history.append({k: self.cfg.get(k) for k in changes})
         del self.history[:-30]
-        self.cfg = update_config(changes)
+        try:
+            self.cfg = update_config(changes)
+        except ConfigUnreadable:
+            self.history.pop()
+            self.message = "Configuration illisible : rien n'a été modifié."
+            return
         notify_daemon()
         self.message = message
 
@@ -159,26 +179,37 @@ class Console:
         self.cfg = load_config()
 
     def undo(self):
-        """Restore the previous state. Unlike commit, this writes it whole."""
+        """Put back the fields the last change touched, and only those."""
         if not self.history:
             self.message = "Rien à annuler."
             return
-        self.cfg = save_config(self.history.pop())
-        notify_daemon()
-        self.message = "Annulé."
+        self.commit(self.history.pop(), "Annulé.")
+        self.history.pop()      # l'annulation elle-même n'est pas à annuler
 
     def lighting(self):
         return resolve_lighting(self.cfg, self.workspace)
 
-    def set_keys(self, names, color, brightness):
-        custom = dict(self.cfg.get("custom_keys", {}))
+    def set_keys(self, names, color=None, brightness=None):
+        """Set a colour and/or an intensity on several keys.
+
+        Each key keeps whatever the other setting already was: applying a
+        colour to a selection used to copy the first key's intensity onto all
+        of them. The map is re-read here rather than reused from the last
+        redraw, because a colour prompt can sit open for seconds while the CLI
+        writes.
+        """
+        custom = dict(load_config().get("custom_keys", {}))
         for name in names:
-            custom[name] = {"color": color, "brightness": brightness}
-        self.commit({"custom_keys": custom},
-                    f"{len(names)} touche(s) : {fmt_color(color)} ({fmt_brightness(brightness)})")
+            entry = custom.get(name, {})
+            custom[name] = {
+                "color": entry.get("color", "inherit") if color is None else color,
+                "brightness": entry.get("brightness", "inherit") if brightness is None else brightness,
+            }
+        shown = fmt_color(color) if color is not None else fmt_brightness(brightness)
+        self.commit({"custom_keys": custom}, f"{len(names)} touche(s) : {shown}")
 
     def reset_keys(self, names):
-        custom = dict(self.cfg.get("custom_keys", {}))
+        custom = dict(load_config().get("custom_keys", {}))
         removed = [n for n in names if custom.pop(n, None) is not None]
         self.commit({"custom_keys": custom}, f"{len(removed)} touche(s) réinitialisée(s).")
 
@@ -245,7 +276,12 @@ class Console:
         self.scr.refresh()
 
     def service_status(self):
-        return "● service actif" if is_service_active() else "○ service inactif"
+        """État du service, mis en cache : c'est un fork de systemctl, et le
+        pied de page est redessiné à chaque frappe."""
+        now = time.monotonic()
+        if now - self._service_checked > SERVICE_POLL_INTERVAL:
+            self._service_ok, self._service_checked = is_service_active(), now
+        return "● service actif" if self._service_ok else "○ service inactif"
 
     def ask(self, label, default=""):
         """Read a line of text on the hint line. Empty input returns `default`."""
@@ -462,9 +498,8 @@ def ask_brightness(console, label="Intensité (0-10, inherit) : "):
 
 def screen_backlight(console):
     def rows(c):
-        lit = c.cfg.get("backlight", True) and c.cfg.get("brightness", 10) > 0
         return [
-            ("État", "allumé" if lit else "éteint", toggle_backlight),
+            ("État", "allumé" if is_lit(c.cfg) else "éteint", toggle_backlight),
             ("Couleur", fmt_color(c.cfg.get("bg_color")), set_bg_color),
             ("Intensité", fmt_brightness(c.cfg.get("brightness")), set_brightness),
             ("Durée du fondu", f"{c.cfg.get('fade_duration', 0.45)} s", set_fade),
@@ -472,10 +507,16 @@ def screen_backlight(console):
         ]
 
     def toggle_backlight(c):
-        on = not (c.cfg.get("backlight", True) and c.cfg.get("brightness", 10) > 0)
+        on = not is_lit(c.cfg)
         changes = {"backlight": on}
-        if on and c.cfg.get("brightness", 10) == 0:
-            changes["brightness"] = 10
+        if on:
+            if resolve_brightness(c.cfg.get("brightness"), 10) == 0:
+                changes["brightness"] = 10
+            if parse_color(c.cfg.get("bg_color"), default=None) in (None, [0, 0, 0]):
+                # Comme `aorus rgb on` : rallumer un fond noir doit retrouver
+                # une teinte, sinon la console annonce « allumé » sur du noir.
+                saved = parse_color(c.cfg.get("saved_color"), default=None)
+                changes["bg_color"] = saved if saved and saved != [0, 0, 0] else get_theme_accent_color()
         c.commit(changes, "Rétroéclairage " + ("allumé." if on else "éteint."))
 
     def set_bg_color(c):
@@ -716,12 +757,12 @@ def screen_keys(console):
         elif key == ord("c"):
             color = ask_color(console)
             if color is not None:
-                console.set_keys(targets(), color, _current_brightness(console, targets()))
+                console.set_keys(targets(), color=color)
                 marks.clear()
         elif key == ord("b"):
             value = ask_brightness(console)
             if value is not None:
-                console.set_keys(targets(), _current_color(console, targets()), value)
+                console.set_keys(targets(), brightness=value)
                 marks.clear()
         elif key == ord("r"):
             console.reset_keys(targets())
@@ -735,18 +776,7 @@ def screen_keys(console):
 
         col = max(0, min(col, len(nav[row]) - 1))
         if brush and key in (curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_UP, curses.KEY_DOWN):
-            console.set_keys([current()], brush[0], brush[1])
-
-
-def _current_color(console, names):
-    """Color already set on the first target, so `b` alone does not erase it."""
-    info = console.cfg.get("custom_keys", {}).get(names[0], {})
-    return info.get("color", "inherit")
-
-
-def _current_brightness(console, names):
-    info = console.cfg.get("custom_keys", {}).get(names[0], {})
-    return info.get("brightness", "inherit")
+            console.set_keys([current()], color=brush[0], brightness=brush[1])
 
 
 def _ask_brush(console):
@@ -778,29 +808,22 @@ def _ask_group(console):
 
 def screen_main(console):
     def rows(c):
-        lit = c.cfg.get("backlight", True) and c.cfg.get("brightness", 10) > 0
         bg = f"{fmt_color(c.cfg.get('bg_color'))} ({fmt_brightness(c.cfg.get('brightness'))})"
         return [
-            ("Rétroéclairage", bg if lit else "éteint", _open(screen_backlight)),
+            ("Rétroéclairage", bg if is_lit(c.cfg) else "éteint", screen_backlight),
             ("Flash à la frappe",
              f"{fmt_color(c.cfg.get('flash_color'))} ({fmt_brightness(c.cfg.get('flash_brightness'))})"
-             if c.cfg.get("flash", True) else "désactivé", _open(screen_flash)),
-            ("Touches personnalisées", f"{len(c.cfg.get('custom_keys', {}))} configurée(s)", _open(screen_keys)),
-            ("Presets", f"{len(list_presets())} enregistré(s)", _open(screen_presets)),
+             if c.cfg.get("flash", True) else "désactivé", screen_flash),
+            ("Touches personnalisées", f"{len(c.cfg.get('custom_keys', {}))} configurée(s)", screen_keys),
+            ("Presets", f"{len(list_presets())} enregistré(s)", screen_presets),
             ("Intégration OS",
-             f"workspace {c.workspace}" if c.cfg.get("workspace_key") else "désactivée", _open(screen_os)),
-            ("Manuel", "touches et commandes", _open(screen_help)),
+             f"workspace {c.workspace}" if c.cfg.get("workspace_key") else "désactivée", screen_os),
+            ("Manuel", "touches et commandes", screen_help),
             ("Quitter", "", lambda c: False),
         ]
 
     console.menu("Console de configuration", rows,
                  "↑↓ naviguer   ↵ ouvrir   u annuler   ? manuel   q quitter")
-
-
-def _open(screen):
-    def handler(console):
-        screen(console)
-    return handler
 
 
 def run_tui():
@@ -810,9 +833,14 @@ def run_tui():
         stdscr.keypad(True)
         screen_main(Console(stdscr))
 
-    # curses draws bytes: without the user locale the arrow glyphs come out mangled.
-    locale.setlocale(locale.LC_ALL, "")
     try:
+        # curses draws bytes: without the user locale the arrow glyphs come out
+        # mangled. A locale the system never generated is not a reason to
+        # refuse to start -- the box glyphs simply degrade.
+        try:
+            locale.setlocale(locale.LC_ALL, "")
+        except locale.Error:
+            pass
         curses.wrapper(main)
     except KeyboardInterrupt:
         # Ctrl+C is a legitimate way to close the console. curses.wrapper has

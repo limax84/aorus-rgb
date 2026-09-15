@@ -6,7 +6,8 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SHARE_DIR="$HOME/.local/share/aorus-rgb"
 BIN_DIR="$HOME/.local/bin"
-UDEV_RULE="/etc/udev/rules.d/99-gigabyte-keyboard.rules"
+UDEV_RULE="/etc/udev/rules.d/60-gigabyte-keyboard.rules"
+LEGACY_RULE="/etc/udev/rules.d/99-gigabyte-keyboard.rules"   # versions < uaccess
 
 echo "═══════════════════════════════════════════════════════"
 echo "        Installation de Aorus RGB Keyboard Daemon       "
@@ -33,21 +34,24 @@ fi
 
 # 2. Règle udev. Elle est comparée, pas seulement testée pour sa présence :
 #    une règle périmée laissait les versions antérieures exposer les frappes
-#    clavier à tous les processus locaux (MODE="0666").
+#    clavier à tous les processus locaux (MODE="0666"). L'ancien fichier 99-
+#    doit disparaître, sinon il continue d'accorder cet accès.
 echo "[2/5] Permissions du périphérique (udev)..."
+SOURCE_RULE="$REPO_DIR/udev/60-gigabyte-keyboard.rules"
 if [ ! -d /etc/udev/rules.d ]; then
     echo "⚠ Pas de /etc/udev/rules.d : système sans udev, étape ignorée."
-elif cmp -s "$REPO_DIR/udev/99-gigabyte-keyboard.rules" "$UDEV_RULE"; then
+elif cmp -s "$SOURCE_RULE" "$UDEV_RULE" && [ ! -e "$LEGACY_RULE" ]; then
     echo "✓ Règle à jour."
 else
     if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
-    if $SUDO cp "$REPO_DIR/udev/99-gigabyte-keyboard.rules" "$UDEV_RULE"; then
+    if $SUDO cp "$SOURCE_RULE" "$UDEV_RULE" && $SUDO rm -f "$LEGACY_RULE"; then
         $SUDO udevadm control --reload-rules
         $SUDO udevadm trigger --subsystem-match=hidraw --subsystem-match=input
         echo "✓ Règle installée et rechargée."
     else
         echo "⚠ Installation manuelle nécessaire :"
-        echo "   sudo cp $REPO_DIR/udev/99-gigabyte-keyboard.rules $UDEV_RULE"
+        echo "   sudo cp $SOURCE_RULE $UDEV_RULE"
+        echo "   sudo rm -f $LEGACY_RULE"
         echo "   sudo udevadm control --reload-rules && sudo udevadm trigger"
     fi
 fi
@@ -56,7 +60,7 @@ fi
 echo "[3/5] Démon et console dans $SHARE_DIR..."
 mkdir -p "$SHARE_DIR"
 cp "$REPO_DIR"/src/*.py "$SHARE_DIR/"
-cp "$REPO_DIR/udev/99-gigabyte-keyboard.rules" "$SHARE_DIR/"   # référence pour `aorus rgb doctor`
+cp "$REPO_DIR/udev/60-gigabyte-keyboard.rules" "$SHARE_DIR/"   # référence pour `aorus rgb doctor`
 chmod +x "$SHARE_DIR/aorus_rgb.py"
 echo "✓ Installés."
 

@@ -18,7 +18,7 @@ for p in [LOCAL_SRC, REPO_SRC]:
         sys.path.insert(0, p)
 
 from aorus_rgb import (
-    PRESET_KEYS, delete_preset, describe_preset, fmt_brightness, fmt_color,
+    ConfigUnreadable, PRESET_KEYS, is_lit, delete_preset, describe_preset, fmt_brightness, fmt_color,
     group_custom_keys, is_inherit, is_service_active, list_presets, load_config,
     notify_daemon, parse_brightness_arg, parse_color, parse_color_arg,
     active_workspace, get_theme_accent_color, hardware_checks, preset_exists,
@@ -32,7 +32,12 @@ RULE = "═" * 60
 
 def apply(changes, message):
     """Write config changes, wake the daemon, then report the resulting state."""
-    update_config(changes)
+    try:
+        update_config(changes)
+    except ConfigUnreadable as err:
+        print(f"Erreur: {err} est illisible ; rien n'a été modifié.")
+        print("Vérifiez ses permissions, ou supprimez-le pour repartir des valeurs par défaut.")
+        sys.exit(1)
     notify_daemon()
     print(message)
     cmd_status()
@@ -46,8 +51,8 @@ def cmd_status():
     light = resolve_lighting(cfg, workspace)
     custom_keys = cfg.get("custom_keys", {})
     flash_desc = f"{fmt_color(cfg.get('flash_color'))} ({fmt_brightness(cfg.get('flash_brightness'))})"
-    flash_on = light.flash and light.flash_brightness > 0
-    lit = light.backlight and light.brightness > 0
+    flash_on = light.flash_active if not light.is_dark else (light.flash and light.flash_brightness > 0)
+    lit = is_lit(cfg)
 
     if light.is_dark:
         mode = "Clavier éteint"
@@ -126,7 +131,7 @@ def cmd_off():
 
 def cmd_toggle():
     cfg = load_config()
-    if cfg.get("backlight", True) and cfg.get("brightness", 10) > 0:
+    if is_lit(cfg):
         cmd_off()
     else:
         cmd_on()
@@ -184,12 +189,35 @@ def cmd_workspace_brightness(val_str):
                            "garde l'intensité de la touche", {"workspace_key": True})
 
 
+def dispatch_setting(args, *, color, brightness, usage, extras=()):
+    """Shape shared by `flash …` and `workspace …`.
+
+    Both take a colour, an intensity, and accept either bare. `extras` carries
+    what is specific to one of them, as (name, handler) pairs tried first.
+    """
+    sub = args[0].lower().strip() if args else ""
+    for name, handler in extras:
+        if sub == name:
+            handler(args[1:])
+            return
+    if sub == "color":
+        needs_arg(usage["color"], color, args[1:])
+    elif sub in ("brightness", "intensity"):
+        needs_arg(usage["brightness"], brightness, args[1:])
+    elif isinstance(parse_brightness_arg(sub), int):
+        brightness(sub)                     # `… 8`
+    elif parse_color_arg(sub) is not None:
+        color(sub)                          # `… cyan`
+    else:
+        print(usage["help"])
+
+
 def cmd_flash(args):
+    """`aorus rgb flash …` — on/off, couleur, intensité, tout hériter."""
     if not args:
         enabled = not load_config().get("flash", True)
         apply({"flash": enabled}, f"✓ Effet flash {'ACTIVÉ' if enabled else 'DÉSACTIVÉ'}.")
         return
-
     sub = args[0].lower().strip()
     if sub in ("on", "off"):
         apply({"flash": sub == "on"},
@@ -197,23 +225,16 @@ def cmd_flash(args):
     elif is_inherit(sub):
         apply({"flash_color": "inherit", "flash_brightness": "inherit", "flash": True},
               "✓ Effet flash réglé sur INHERIT (couleur et luminosité héritées de chaque touche).")
-    elif sub in ("brightness", "intensity"):
-        if len(args) > 1:
-            cmd_flash_brightness(args[1])
-        else:
-            print("Usage: aorus rgb flash brightness <0-10|inherit>")
-    elif sub == "color":
-        if len(args) > 1:
-            cmd_flash_color(args[1])
-        else:
-            print("Usage: aorus rgb flash color <inherit|white|yellow|cyan|028391|#hex>")
-            print("Astuce: en terminal, passez les codes hex sans '#' (ex: ffffff) ou entre guillemets (ex: \"#ffffff\").")
-    elif isinstance(parse_brightness_arg(sub), int):
-        cmd_flash_brightness(sub)          # `aorus rgb flash 8`
-    elif parse_color(sub) is not None:
-        cmd_flash_color(sub)               # `aorus rgb flash cyan`
     else:
-        print(f"Sous-commande flash inconnue: {sub}")
+        dispatch_setting(args, color=cmd_flash_color, brightness=cmd_flash_brightness, usage={
+            "color": "flash color <inherit|white|yellow|cyan|028391|#hex>",
+            "brightness": "flash brightness <0-10|inherit>",
+            "help": ("Usage: aorus rgb flash on | off\n"
+                     "       aorus rgb flash color <couleur|inherit>\n"
+                     "       aorus rgb flash brightness <0-10|inherit>\n"
+                     "       aorus rgb flash inherit"),
+        })
+
 
 def cmd_color(color_str):
     rgb = parse_color_arg(color_str)
@@ -247,6 +268,12 @@ def cmd_key_clear():
     apply({"custom_keys": {}},
           f"✓ {count} touche(s) personnalisée(s) réinitialisée(s). Clavier remis en couleur globale.")
 
+def looks_like_hex(text):
+    """True for a bare 3- or 6-digit hex colour, which is never a brightness."""
+    clean = text.strip().lstrip("#")
+    return len(clean) in (3, 6) and all(c in "0123456789abcdefABCDEF" for c in clean)
+
+
 def parse_key_value(args):
     """Parse the <couleur[:luminosité]> [luminosité] arguments of `key`.
 
@@ -257,6 +284,11 @@ def parse_key_value(args):
         color_arg, brightness_arg = (part.strip() for part in args[0].split(":", 1))
     elif len(args) >= 2:
         color_arg, brightness_arg = args[0].strip(), args[1].strip()
+    elif looks_like_hex(args[0]):
+        # `key wasd 028391` est une couleur : une intensité ne fait qu'un ou
+        # deux caractères, et `000000` détourné en « intensité 0 » éteignait
+        # les touches sans rien dire.
+        color_arg, brightness_arg = args[0].strip(), "inherit"
     elif args[0].strip().isdigit():
         color_arg, brightness_arg = "inherit", args[0].strip()
     else:
@@ -414,31 +446,28 @@ def cmd_preset(args):
 # ----------------- WORKSPACE INDICATOR -----------------
 
 def cmd_workspace(args):
-    """Highlight the digit key of the active Hyprland workspace."""
-    cfg = load_config()
+    """`aorus rgb workspace …` — éclaire le chiffre du workspace actif."""
     sub = args[0].lower().strip() if args else "toggle"
-
     if sub in ("on", "off", "toggle"):
-        state = not cfg.get("workspace_key") if sub == "toggle" else sub == "on"
+        state = (not load_config().get("workspace_key")) if sub == "toggle" else sub == "on"
         apply({"workspace_key": state},
               f"✓ Indicateur de workspace {'ACTIVÉ' if state else 'DÉSACTIVÉ'}.")
-    elif sub == "dark":
-        state = not cfg.get("workspace_dark") if len(args) < 2 else args[1].lower() == "on"
+        return
+
+    def toggle_dark(rest):
+        state = (not load_config().get("workspace_dark")) if not rest else rest[0].lower() == "on"
         apply({"workspace_dark": state},
               f"✓ Indicateur sur clavier éteint {'ACTIVÉ (coûte le mode 0 % CPU)' if state else 'DÉSACTIVÉ'}.")
-    elif sub == "color":
-        needs_arg("workspace color <inherit|cyan|theme|#hex>", cmd_workspace_color, args[1:])
-    elif sub in ("brightness", "intensity"):
-        needs_arg("workspace brightness <0-10|inherit>", cmd_workspace_brightness, args[1:])
-    elif isinstance(parse_brightness_arg(sub), int):
-        cmd_workspace_brightness(sub)      # `aorus rgb workspace 8`
-    elif parse_color_arg(sub) is not None:
-        cmd_workspace_color(sub)           # `aorus rgb workspace cyan`
-    else:
-        print("Usage: aorus rgb workspace on | off | toggle")
-        print("       aorus rgb workspace color <couleur|inherit>")
-        print("       aorus rgb workspace brightness <0-10>")
-        print("       aorus rgb workspace dark [on|off]")
+
+    dispatch_setting(args, color=cmd_workspace_color, brightness=cmd_workspace_brightness,
+                     extras=(("dark", toggle_dark),), usage={
+                         "color": "workspace color <inherit|cyan|theme|#hex>",
+                         "brightness": "workspace brightness <0-10|inherit>",
+                         "help": ("Usage: aorus rgb workspace on | off | toggle\n"
+                                  "       aorus rgb workspace color <couleur|inherit>\n"
+                                  "       aorus rgb workspace brightness <0-10|inherit>\n"
+                                  "       aorus rgb workspace dark [on|off]"),
+                     })
 
 
 USAGE = """

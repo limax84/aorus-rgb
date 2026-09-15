@@ -62,7 +62,7 @@ aorus rgb doctor
   ✓ Contrôleur d'éclairage  0414:8007 interface 3 sur /dev/hidraw3
   ✓ Accès au contrôleur     ouverture en écriture réussie
   ✓ Clavier de frappe       GIGABYTE USB-HID Keyboard sur /dev/input/event6
-  ✓ Règle udev              /etc/udev/rules.d/99-gigabyte-keyboard.rules
+  ✓ Règle udev              /etc/udev/rules.d/60-gigabyte-keyboard.rules
   ✓ Service systemd         aorus-rgb.service actif
 ```
 
@@ -76,13 +76,17 @@ restent dans `~/.config/aorus-rgb`).
 
 La règle udev accorde l'accès via `TAG+="uaccess"`, c'est-à-dire une ACL pour
 l'utilisateur de la session locale active — la façon normale de partager un
-périphérique d'entrée.
+périphérique d'entrée. Son préfixe `60-` compte : systemd applique le tag depuis
+`73-seat-late.rules`, et udev lit les fichiers dans l'ordre des noms, donc un tag
+posé par un fichier `99-` n'aurait aucun effet.
 
 > **Mise à jour importante.** Les versions antérieures à cette règle utilisaient
 > `MODE="0666"`, qui donnait le même accès à **tout processus local** : sur le
 > nœud `event*` du clavier, n'importe quel programme pouvait lire toutes les
 > frappes, mots de passe compris. Si vous avez installé le projet avant, relancez
-> `./install.sh` : il compare la règle en place et la remplace.
+> `./install.sh` : il pose la nouvelle règle **et supprime l'ancienne**
+> `99-gigabyte-keyboard.rules`, qui accorderait encore cet accès si elle restait.
+> `aorus rgb doctor` le signale tant que ce n'est pas fait.
 
 ---
 
