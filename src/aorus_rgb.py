@@ -17,6 +17,7 @@ import copy
 import socket
 import select
 import fcntl
+import stat
 import signal
 import subprocess
 import unicodedata
@@ -891,6 +892,21 @@ def reference_udev_rule():
     return None
 
 
+def world_accessible(path):
+    """True when any local process can read or write this device node.
+
+    Checking the rule file is not enough: udev leaves the permissions a
+    previous rule set until the device is added again, so a machine can carry
+    the old MODE="0666" exposure while holding a perfectly correct rule.
+    """
+    if not path:
+        return False
+    try:
+        return bool(os.stat(path).st_mode & (stat.S_IROTH | stat.S_IWOTH))
+    except OSError:
+        return False
+
+
 def hardware_checks():
     """Everything that has to be true for the daemon to drive the keyboard.
 
@@ -914,9 +930,10 @@ def hardware_checks():
             checks.append(Check(False, "Accès au contrôleur",
                                 f"{err} — règle udev absente ou session sans accès local"))
 
-    keyboard = open_keyboard_input()
+    keyboard, keyboard_path = open_keyboard_input(), None
     if keyboard:
-        checks.append(Check(True, "Clavier de frappe", f"{keyboard.name} sur {keyboard.path}"))
+        keyboard_path = keyboard.path
+        checks.append(Check(True, "Clavier de frappe", f"{keyboard.name} sur {keyboard_path}"))
         keyboard.close()
     else:
         checks.append(Check(False, "Clavier de frappe",
@@ -936,8 +953,15 @@ def hardware_checks():
         current, detail = False, f"ancienne règle {LEGACY_UDEV_RULE} à supprimer — relancez ./install.sh"
     checks.append(Check(current, "Règle udev", detail))
 
-    checks.append(Check(is_service_active(), "Service systemd",
-                        SERVICE + (" actif" if is_service_active() else " inactif")))
+    exposed = [node for node in (path.decode() if path else None,
+                                 keyboard_path) if world_accessible(node)]
+    checks.append(Check(not exposed, "Exposition",
+                        "aucun nœud accessible à tous" if not exposed else
+                        f"{', '.join(exposed)} accessible(s) à tout processus local — "
+                        "redémarrez ou rebranchez le clavier pour appliquer la règle"))
+
+    active = is_service_active()
+    checks.append(Check(active, "Service systemd", SERVICE + (" actif" if active else " inactif")))
     return checks
 
 

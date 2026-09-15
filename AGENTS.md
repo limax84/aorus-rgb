@@ -81,7 +81,8 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 - `install.sh` **compare** la règle en place à celle du dépôt et la remplace si elle diffère. Il ne faut pas revenir à un simple test de présence : les installations existantes garderaient éternellement l'ancienne règle, correctif de sécurité compris.
 - `install.sh` **supprime aussi l'ancien `99-gigabyte-keyboard.rules`** (`LEGACY_UDEV_RULE`) : le laisser en place continuerait d'accorder `MODE="0666"` quoi que dise la nouvelle règle. `hardware_checks()` le signale tant qu'il existe.
 - La règle est le seul fichier hors du répertoire utilisateur, et `uninstall.sh` retire les deux.
-- `hardware_checks()` est la source unique du diagnostic (`aorus rgb doctor`, fin d'`install.sh`) : matériel présent, contrôleur ouvrable, clavier lisible, règle à jour, service actif.
+- `hardware_checks()` est la source unique du diagnostic (`aorus rgb doctor`, fin d'`install.sh`) : matériel présent, contrôleur ouvrable, clavier lisible, règle à jour, **exposition réelle**, service actif.
+- La vérification d'exposition (`world_accessible()`) regarde les droits des vrais nœuds, pas le contenu de la règle : udev conserve les permissions posées par une règle précédente jusqu'au prochain événement `add`, si bien qu'une machine peut porter une règle parfaitement correcte **et** rester exposée jusqu'au redémarrage. Ne pas remplacer ce test par une comparaison de fichier.
 
 ---
 

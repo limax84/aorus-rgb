@@ -304,6 +304,21 @@ def test_device_access():
     check("le contrôleur absent renvoie None, pas un chemin deviné",
           A.find_lighting_path.__doc__ and "None" in A.find_lighting_path.__doc__)
 
+    # udev laisse en place les permissions posées par une règle précédente
+    # jusqu'au prochain événement « add » : une règle correcte ne prouve donc
+    # pas que l'exposition a cessé. Le diagnostic doit regarder les vrais nœuds.
+    directory = tempfile.mkdtemp()
+    node = os.path.join(directory, "faux-noeud")
+    open(node, "w").close()
+    os.chmod(node, 0o666)
+    check("un nœud accessible à tous est détecté", A.world_accessible(node))
+    os.chmod(node, 0o660)
+    check("un nœud correctement restreint ne l'est pas", not A.world_accessible(node))
+    check("un chemin absent ne déclenche rien",
+          not A.world_accessible(os.path.join(directory, "absent")) and not A.world_accessible(None))
+    check("le diagnostic couvre l'exposition",
+          any(c.label == "Exposition" for c in A.hardware_checks()))
+
 
 def test_console_edits():
     print("édition depuis la console")

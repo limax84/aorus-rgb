@@ -111,6 +111,8 @@ def cmd_doctor():
     print("  • matériel non détecté  : ce contrôleur n'équipe que certains portables Aorus.")
     print("  • règle udev            : ./install.sh (demande sudo), puis rebranchez ou redémarrez.")
     print("  • service inactif       : systemctl --user start aorus-rgb.service")
+    print("  • nœuds exposés         : la règle est posée mais les permissions datent")
+    print("                            de l'ancienne ; redémarrez ou rebranchez le clavier.")
     sys.exit(1)
 
 

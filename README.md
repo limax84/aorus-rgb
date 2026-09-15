@@ -63,6 +63,7 @@ aorus rgb doctor
   ✓ Accès au contrôleur     ouverture en écriture réussie
   ✓ Clavier de frappe       GIGABYTE USB-HID Keyboard sur /dev/input/event6
   ✓ Règle udev              /etc/udev/rules.d/60-gigabyte-keyboard.rules
+  ✓ Exposition              aucun nœud accessible à tous
   ✓ Service systemd         aorus-rgb.service actif
 ```
 
@@ -265,6 +266,7 @@ journalctl --user -u aorus-rgb.service -f
 | `aorus rgb doctor` : contrôleur absent | machine non équipée du `0414:8007` | `lsusb \| grep 0414` pour confirmer ; le projet ne peut rien faire |
 | `doctor` : accès au contrôleur refusé | règle udev absente ou non appliquée | `./install.sh`, puis rebranchez le clavier ou redémarrez |
 | `doctor` : règle udev périmée | règle d'une version antérieure | `./install.sh` la remplace |
+| `doctor` : nœuds exposés | permissions laissées par l'ancienne règle | redémarrez, ou rebranchez le clavier : udev ne recalcule les droits qu'au prochain branchement |
 | Le clavier ne réagit pas | service arrêté | `aorus rgb restart`, puis `journalctl --user -u aorus-rgb.service` |
 | Le flash ne part pas | clavier de frappe illisible | `doctor` le signale ; règle udev, ou appartenance au groupe `input` |
 | `aorus : commande introuvable` | `~/.local/bin` hors du `PATH` | ajoutez-le à votre shell |
