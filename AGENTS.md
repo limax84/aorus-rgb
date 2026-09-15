@@ -88,11 +88,14 @@ Règles de découpage à respecter :
 - **Presets** : `~/.config/aorus-rgb/presets/<nom>.json`. Le démon ne les connaît pas : un preset est chargé en écrivant ses champs dans la config.
 - **PID du démon** : `~/.config/aorus-rgb/daemon.pid`. `daemon_pid()` vérifie `/proc/<pid>/cmdline` avant de signaler : un fichier PID périmé ne doit jamais faire envoyer `SIGUSR1` au processus qui a hérité de ce PID.
 - L'écrivain écrit le JSON puis envoie `SIGUSR1`, ce qui débloque le `select()` du démon **via un self-pipe** (`signal.set_wakeup_fd`) : sans lui, PEP 475 ferait simplement reprendre l'attente avec le temps restant au lieu de réveiller la boucle.
+- Débloquer le `select()` **ne suffit pas** : `wait_events()` renvoie `signalled`, et la boucle remet `last_reload` à zéro pour relire au tour suivant. Sans ça, la relecture reste derrière `CONFIG_POLL_INTERVAL` et le signal n'accélère rien — c'est exactement la régression qu'a produite le passage du sondage de 0,2 s à 2 s. Un test mesure ce délai (`test_reload_latency`).
+- L'empreinte de la config n'est sérialisée **qu'au rechargement**, pas à chaque tour : pendant un fondu la boucle tourne 100 fois par seconde, et un `json.dumps()` de la config complète à cette cadence serait du gaspillage pur.
 
 ### Invariants de la config — à ne pas casser
 
 - **`save_config()` écrit dans un fichier temporaire puis `os.replace()`.** Le démon relit ce fichier pendant que la CLI l'écrit ; une écriture en place lui ferait lire du JSON tronqué.
 - **`load_config()` ne réécrit jamais un fichier qu'il n'a pas su lire.** L'ancienne version retombait sur `save_config(DEFAULT_CONFIG)` en cas d'erreur de lecture : une seule lecture malheureuse effaçait toutes les touches personnalisées de l'utilisateur.
+- **`load_config()` normalise `custom_keys`** : un fichier édité à la main peut contenir n'importe quoi, et un mauvais type faisait planter le démon en boucle de redémarrage systemd. On nettoie à l'entrée plutôt qu'à chaque usage ; `resolve_key_settings()` garde tout de même son test de type, puisqu'on l'appelle aussi sur des configs construites à la main.
 - `save_config()` filtre sur les clés de `DEFAULT_CONFIG` : les réglages devenus obsolètes disparaissent d'eux-mêmes, et une clé inconnue ne survit pas à un enregistrement.
 
 ---

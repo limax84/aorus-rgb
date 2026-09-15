@@ -247,9 +247,10 @@ def resolve_key_settings(cfg, raw_bg, global_b, ws_pos=None):
     raw_bg = tuple(raw_bg)
     settings = {pos: (raw_bg, global_b) for pos in VALID_POSITIONS}
 
-    for kname, cinfo in cfg.get("custom_keys", {}).items():
+    custom = cfg.get("custom_keys")
+    for kname, cinfo in (custom.items() if isinstance(custom, dict) else ()):
         pos = EVDEV_TO_LED.get(kname)
-        if pos not in settings:
+        if pos not in settings or not isinstance(cinfo, dict):
             continue
         parsed = parse_color(cinfo.get("color"), default=None)
         settings[pos] = (tuple(parsed) if parsed is not None else raw_bg,
@@ -400,6 +401,11 @@ def load_config():
         return cfg
     if isinstance(stored, dict):
         cfg.update({k: v for k, v in stored.items() if k in DEFAULT_CONFIG})
+    # A hand-edited file can hold anything. Normalizing here rather than at
+    # each use keeps a bad type from crashing the daemon into a restart loop.
+    keys = cfg.get("custom_keys")
+    cfg["custom_keys"] = ({k: v for k, v in keys.items() if isinstance(v, dict)}
+                          if isinstance(keys, dict) else {})
     return cfg
 
 
@@ -978,14 +984,15 @@ def render_frame(lighting, active_fades, now):
     return frame
 
 
-def theme_stamp(cfg):
-    """Mtime of the Omarchy theme, but only while the background follows it.
+def theme_stamp(cfg_state):
+    """Mtime of the Omarchy theme, but only while some setting follows it.
 
-    This is what makes `aorus rgb color theme` track the theme instead of
-    freezing the accent it had the day it was set.
+    This is what makes `theme` track the theme instead of freezing the accent
+    it had the day it was set. Any value can be the literal `theme` -- the
+    background, the flash, the workspace digit, a custom key -- so the test is
+    run on the serialized config rather than on one field.
     """
-    bg = cfg.get("bg_color")
-    if not (isinstance(bg, str) and bg.strip().lower() == "theme"):
+    if '"theme"' not in cfg_state:
         return ""
     path = omarchy_theme_file()
     try:
@@ -1027,7 +1034,8 @@ def run_daemon():
     input_dev = None
 
     active_fades = {}  # {led_pos: flash start time}
-    cfg, fingerprint, light = load_config(), None, None
+    cfg, cfg_state, theme = {}, "", ""
+    fingerprint, light = None, None
     last_reload = last_tick = 0.0
 
     while True:
@@ -1049,8 +1057,12 @@ def run_daemon():
 
         if now - last_reload > CONFIG_POLL_INTERVAL:
             cfg, last_reload = load_config(), now
+            # Serialized once per reload: rebuilding this every iteration would
+            # mean a full JSON dump a hundred times a second during a fade.
+            cfg_state = json.dumps(cfg, sort_keys=True)
+            theme = theme_stamp(cfg_state)
 
-        current = (json.dumps(cfg, sort_keys=True), workspaces.active, theme_stamp(cfg))
+        current = (cfg_state, workspaces.active, theme)
         changed = current != fingerprint
         if changed:
             light, fingerprint = resolve_lighting(cfg, workspaces.active), current
@@ -1075,7 +1087,11 @@ def run_daemon():
                 controller.send_frame(light.base_map, hw_brightness=HW_FULL_BRIGHTNESS)
             timeout = FADE_TIMEOUT if (flash_on and active_fades) else IDLE_TIMEOUT
 
-        pressed = wait_events(input_dev, workspaces, wake_fd, timeout)
+        pressed, signalled = wait_events(input_dev, workspaces, wake_fd, timeout)
+        if signalled:
+            # SIGUSR1 from a CLI or console write: re-read at the top of the
+            # next pass instead of waiting out CONFIG_POLL_INTERVAL.
+            last_reload = 0.0
         if pressed is None:
             input_dev.close()
             input_dev = None
@@ -1095,22 +1111,25 @@ def run_daemon():
 def wait_events(input_dev, workspaces, wake_fd, timeout):
     """Block until a keypress, a workspace switch, a CLI signal or the timeout.
 
-    Returns the LED positions just pressed, or None if the keyboard went away.
+    Returns (pressed LED positions, signalled). `pressed` is None when the
+    keyboard went away; `signalled` says a signal arrived, which is the
+    daemon's cue to re-read the config at once.
     """
     fds = [input_dev, wake_fd] + ([workspaces] if workspaces.sock else [])
     try:
         ready, _, _ = select.select(fds, [], [], timeout)
     except OSError:
-        return None
+        return None, False
 
-    if wake_fd in ready:
+    signalled = wake_fd in ready
+    if signalled:
         try:
             os.read(wake_fd, 4096)
         except OSError:
             pass
     if workspaces in ready or not workspaces.sock:
         workspaces.poll()
-    return drain_input(input_dev) if input_dev in ready else []
+    return (drain_input(input_dev) if input_dev in ready else []), signalled
 
 
 if __name__ == "__main__":

@@ -10,10 +10,13 @@ import copy
 import json
 import os
 import select
+import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 import aorus_rgb as A  # noqa: E402
@@ -111,9 +114,45 @@ def test_theme():
         return
     check("bg_color 'theme' se résout au rendu",
           A.resolve_lighting(dict(base, bg_color="theme")).raw_bg == A.get_theme_accent_color())
-    check("l'empreinte suit le thème", A.theme_stamp(dict(base, bg_color="theme")) != "")
-    check("l'empreinte est vide sur une couleur fixe",
-          A.theme_stamp(dict(base, bg_color=[1, 2, 3])) == "")
+    check("l'empreinte suit le thème",
+          A.theme_stamp(json.dumps(dict(base, bg_color="theme"))) != "")
+    # Le fond n'est pas le seul réglage qui peut valoir "theme".
+    check("l'empreinte couvre aussi le flash",
+          A.theme_stamp(json.dumps(dict(base, flash_color="theme"))) != "")
+    check("l'empreinte couvre aussi une touche personnalisée",
+          A.theme_stamp(json.dumps(dict(base, custom_keys={"KEY_A": {"color": "theme"}}))) != "")
+    check("l'empreinte est vide sans aucun 'theme'",
+          A.theme_stamp(json.dumps(dict(base, bg_color=[1, 2, 3]))) == "")
+
+
+def test_hostile_config():
+    print("config éditée à la main")
+    directory = tempfile.mkdtemp()
+    A.CONFIG_DIR, A.CONFIG_FILE = directory, os.path.join(directory, "config.json")
+
+    # Une valeur du mauvais type ne doit pas tuer le démon en boucle de
+    # redémarrage : load_config normalise, resolve_lighting se garde aussi.
+    for label, stored in (("custom_keys = chaîne", {"custom_keys": "nawak"}),
+                          ("custom_keys = liste", {"custom_keys": [1, 2, 3]}),
+                          ("entrée non-dict", {"custom_keys": {"KEY_A": "rouge"}}),
+                          ("entrée nulle", {"custom_keys": {"KEY_A": None}})):
+        with open(A.CONFIG_FILE, "w") as f:
+            json.dump(stored, f)
+        try:
+            A.resolve_lighting(A.load_config(), "3")
+            ok, detail = True, ""
+        except Exception as err:
+            ok, detail = False, f"{type(err).__name__}: {err}"
+        check(f"survit à {label}", ok, detail)
+
+    with open(A.CONFIG_FILE, "w") as f:
+        json.dump({"custom_keys": {"KEY_A": "rouge",
+                                   "KEY_B": {"color": [1, 2, 3], "brightness": 5}}}, f)
+    check("l'entrée valide survit au nettoyage",
+          A.load_config()["custom_keys"] == {"KEY_B": {"color": [1, 2, 3], "brightness": 5}})
+    check("resolve_lighting se garde sans passer par load_config",
+          A.resolve_lighting(dict(copy.deepcopy(A.DEFAULT_CONFIG),
+                                  custom_keys={"KEY_A": "rouge"}), "3") is not None)
 
 
 def test_config_store():
@@ -187,9 +226,85 @@ def test_workspace_events():
     check("la disparition d'Hyprland est gérée", watcher.sock is None)
 
 
+# The daemon with its hardware stubbed out: every frame it would send is
+# timestamped on stdout, which is enough to time how fast it reacts.
+HARNESS = """
+import os, sys, time
+sys.path.insert(0, {src!r})
+import aorus_rgb as A
+d = sys.argv[1]
+A.CONFIG_DIR, A.CONFIG_FILE, A.PID_FILE = d, os.path.join(d, "config.json"), os.path.join(d, "pid")
+def frame(*a, **k):
+    print("FRAME %.4f" % time.time(), flush=True)
+class Controller:
+    current_mode = None
+    def connect(self): pass
+    set_hardware_reactive = set_hardware_off = send_frame = frame
+class Keyboard:
+    def __init__(self): self.fd = os.open(os.devnull, os.O_RDONLY)
+    def fileno(self): return self.fd
+    def read(self): return []
+    def close(self): os.close(self.fd)
+class Watcher:
+    sock = active = None
+    def poll(self): return False
+A.KeyboardController, A.get_keyboard_input_device, A.WorkspaceWatcher = Controller, Keyboard, Watcher
+A.run_daemon()
+"""
+
+
+def test_reload_latency():
+    print("réactivité du démon")
+    directory = tempfile.mkdtemp()
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
+    harness = os.path.join(directory, "harness.py")
+    with open(harness, "w") as f:
+        f.write(HARNESS.format(src=src))
+
+    A.CONFIG_DIR, A.CONFIG_FILE = directory, os.path.join(directory, "config.json")
+    A.save_config(copy.deepcopy(A.DEFAULT_CONFIG))
+    daemon = subprocess.Popen([sys.executable, harness, directory],
+                              stdout=subprocess.PIPE, text=True, bufsize=1)
+
+    def next_frame(limit):
+        """Timestamp of the daemon's next frame, or None."""
+        deadline = time.time() + limit
+        while time.time() < deadline:
+            if select.select([daemon.stdout], [], [], max(0, deadline - time.time()))[0]:
+                line = daemon.stdout.readline()
+                if line.startswith("FRAME"):
+                    return float(line.split()[-1])
+        return None
+
+    try:
+        check("le démon démarre et allume le clavier", next_frame(5) is not None)
+
+        delays = []
+        for i in range(3):
+            start = time.time()
+            A.save_config(dict(A.load_config(), brightness=(i % 9) + 1))
+            os.kill(daemon.pid, signal.SIGUSR1)
+            seen = next_frame(5)
+            delays.append((seen - start) if seen else float("inf"))
+        worst = max(delays)
+        # SIGUSR1 has to break the wait *and* force the re-read. Gating the
+        # reload behind the poll interval made this silently 2 s.
+        check(f"SIGUSR1 applique la config en {worst * 1000:.1f} ms", worst < 0.2, f"{worst:.3f} s")
+
+        start = time.time()
+        A.save_config(dict(A.load_config(), brightness=10))
+        seen = next_frame(3 * A.CONFIG_POLL_INTERVAL)
+        check("sans signal, le sondage rattrape quand même",
+              seen is not None and seen - start < 2.5 * A.CONFIG_POLL_INTERVAL)
+    finally:
+        daemon.kill()
+        daemon.wait()
+
+
 def main():
     for test in (test_inheritance, test_fade_duration, test_workspace, test_theme,
-                 test_workspace_events, test_config_store):
+                 test_workspace_events, test_reload_latency, test_hostile_config,
+                 test_config_store):
         test()
     print(f"\n{len(FAILURES)} échec(s)" + (f" : {', '.join(FAILURES)}" if FAILURES else ""))
     return 1 if FAILURES else 0

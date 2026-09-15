@@ -437,12 +437,15 @@ Commandes disponibles :
 Cascade : clavier -> touche personnalisée -> flash."""
 
 
-def needs_arg(name, handler, args):
-    """Run handler on the first argument, or print the usage line if it is missing."""
+def needs_arg(usage, handler, args):
+    """Run handler on the first argument, or print the usage line if it is missing.
+
+    `usage` already carries its own placeholder, so nothing is appended here.
+    """
     if args:
         handler(args[0])
     else:
-        print(f"Usage: aorus rgb {name} <valeur>")
+        print(f"Usage: aorus rgb {usage}")
 
 
 def main():

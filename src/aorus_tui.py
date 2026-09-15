@@ -725,9 +725,7 @@ def screen_keys(console):
         elif key == ord("p"):
             brush = None if brush else _ask_brush(console)
         elif key == ord("g"):
-            group = _ask_group(console)
-            if group:
-                marks.symmetric_difference_update(resolve_keys(group))
+            marks.symmetric_difference_update(_ask_group(console))
         elif key == ord("u"):
             console.undo()
 
@@ -756,11 +754,20 @@ def _ask_brush(console):
 
 
 def _ask_group(console):
+    """Resolve a group name to keys the map can actually address.
+
+    resolve_keys() knows KEY_COMPOSE, which shares LED 66 with KEY_MENU and so
+    has no cell of its own: marking it would paint a light the cursor can never
+    reach back to.
+    """
     text = console.ask(f"Groupe ({', '.join(GROUPS)}) : ")
-    if text and not resolve_keys(text):
+    if not text:
+        return []
+    drawn = {cell[0] for row in KEYBOARD_ROWS for cell in row if cell}
+    keys = [k for k in resolve_keys(text) if k in drawn]
+    if not keys:
         console.message = f"Groupe '{text}' inconnu."
-        return None
-    return text
+    return keys
 
 
 # ----------------- ENTRY POINT -----------------
