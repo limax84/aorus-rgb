@@ -6,12 +6,17 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 
 ## 1. Contexte Matériel & Architecture USB
 
-- **Périphérique cible** : Contrôleur USB Gigabyte `0414:8007` (parfois accompagné du contrôleur secondaire `0414:8010`).
+- **Périphérique cible** : Contrôleur USB Gigabyte `0414:8007` (`KEYBOARD_VID`/`KEYBOARD_PID`), parfois accompagné du contrôleur secondaire `0414:8010`, que ce projet ignore.
 - **Interfaces USB (`0414:8007`)** :
-  - `Interface 0` : Clavier USB Boot (`/dev/input/by-id/usb-GIGABYTE_USB-HID_Keyboard_AP0000000003-event-kbd`, typiquement `event6`).
+  - `Interface 0` : Clavier USB Boot — c'est lui qui rapporte les frappes (`phys` en `/input0`, typiquement `event6`).
   - `Interface 1` : Clavier / touches de contrôle (`input2`).
   - `Interface 2` : Souris / contrôles consommateurs (`input2`).
-  - `Interface 3` : **Contrôleur d'éclairage RGB** (noeud `hidraw3`, Endpoint `0x85` IN, Endpoint `0x06` OUT).
+  - `Interface 3` (`LIGHTING_INTERFACE`) : **Contrôleur d'éclairage RGB** (typiquement `hidraw3`, Endpoint `0x85` IN, Endpoint `0x06` OUT).
+
+### Détection — ce qu'il ne faut plus faire
+- `find_lighting_path()` renvoie `None` quand le contrôleur est absent. L'ancienne version retombait sur `/dev/hidraw3` en dur : sur une machine non compatible, elle écrivait des trames d'éclairage dans le périphérique HID qui portait ce numéro.
+- `open_keyboard_input()` filtre sur VID/PID **et** un `phys` terminé par `/input0`. Ne pas revenir à un chemin `by-id` : il contient le numéro de série (`AP0000000003`), propre à un exemplaire, et le projet ne marcherait que sur cette machine.
+- Aucun numéro de nœud (`hidraw3`, `event6`) n'est codé en dur : ils changent d'un démarrage et d'une veille à l'autre.
 
 ---
 
@@ -65,7 +70,19 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 
 ---
 
-## 3. Carte du code
+## 3. Permissions du périphérique (udev)
+
+`udev/99-gigabyte-keyboard.rules` accorde l'accès via **`TAG+="uaccess"`**, qui pose une ACL pour l'utilisateur de la session locale active, et restreint la correspondance au `0414:8007`.
+
+- **Ne jamais revenir à `MODE="0666"`.** C'est ce que faisait la règle d'origine, et `ATTRS{idVendor}=="0414"` seul l'appliquait à tous les nœuds du fabricant : le `event*` du clavier devenait lisible par **n'importe quel processus local**, ce qui est un enregistreur de frappe offert à toute application de la machine.
+- Le groupe `input` suffit sur les distributions qui y placent l'utilisateur, mais pas partout ; `uaccess` marche dans les deux cas sans rien exposer.
+- `install.sh` **compare** la règle en place à celle du dépôt et la remplace si elle diffère. Il ne faut pas revenir à un simple test de présence : les installations existantes garderaient éternellement l'ancienne règle, correctif de sécurité compris.
+- La règle est le seul fichier hors du répertoire utilisateur, et `uninstall.sh` la retire.
+- `hardware_checks()` est la source unique du diagnostic (`aorus rgb doctor`, fin d'`install.sh`) : matériel présent, contrôleur ouvrable, clavier lisible, règle à jour, service actif.
+
+---
+
+## 4. Carte du code
 
 | Fichier | Rôle |
 |---|---|
@@ -74,13 +91,14 @@ Ce document est destiné aux agents IA et développeurs travaillant sur la gesti
 | `bin/aorus-rgb` | CLI. N'écrit que la config, ne parle jamais au périphérique. Importe tout le reste de `aorus_rgb`. |
 | `bin/aorus` | Dispatcher : `aorus rgb …` → `aorus-rgb …`. |
 | `tests/test_aorus_rgb.py` | Tests de régression sans dépendance : `python3 tests/test_aorus_rgb.py`. Couvre la cascade, l'étage workspace, le thème, l'analyse des événements Hyprland et les invariants de la config. Les couches USB et curses en sont absentes (matériel requis). |
-| `install.sh` / `uninstall.sh` | Dépendances, règle udev, copie vers `~/.local/{bin,share}`, service systemd. |
+| `install.sh` / `uninstall.sh` | Dépendances, règle udev, copie vers `~/.local/{bin,share}`, service systemd. `install.sh` est idempotent et se termine par `aorus rgb doctor`. |
 
 Règles de découpage à respecter :
 - **Une seule source de vérité, dans `src/aorus_rgb.py`**, pour tout ce que plus d'un appelant utilise : config (`CONFIG_DIR`, `DEFAULT_CONFIG`, `load_config()`, `save_config()`, `update_config()`), presets (`read_preset()`, `write_preset()`, `list_presets()`, `delete_preset()`), contrôle du service (`notify_daemon()`, `is_service_active()`, `restart_service()`, `daemon_pid()`), parsing (`parse_color_arg()`, `parse_brightness_arg()`) et affichage (`fmt_color()`, `fmt_brightness()`, `describe_preset()`). La CLI et la TUI les importent — ne pas les redéfinir.
 - **`bin/aorus-rgb` insère `LOCAL_SRC` puis `REPO_SRC` dans `sys.path`** via `insert(0, …)`, dans cet ordre, pour que le repo prime sur la copie installée dans `~/.local/share/aorus-rgb`. Inverser cette boucle fait silencieusement exécuter l'ancienne version installée lors des tests depuis les sources.
 - Côté CLI, `apply(changes, message)` est le seul chemin d'écriture ; côté TUI, `Console.commit(changes, message)`. Les deux passent par `update_config()` — **lecture, fusion, écriture** — et signalent le démon. Ne jamais réécrire une config gardée en mémoire : la CLI et la console peuvent tourner en même temps, et une écriture en bloc annulerait silencieusement les changements de l'autre. La console relit d'ailleurs le fichier à chaque redessin, ce qui lui fait afficher en direct ce que la CLI écrit.
-- `install.sh` copie `src/*.py` en bloc : ajouter un module à `src/` suffit, rien à déclarer ailleurs.
+- `install.sh` copie `src/*.py` en bloc : ajouter un module à `src/` suffit, rien à déclarer ailleurs. Il y copie aussi la règle udev, qui sert de référence à `reference_udev_rule()` pour détecter une règle installée périmée.
+- Le démon tourne sur la copie de `~/.local/share/aorus-rgb`, la CLI lancée depuis le dépôt sur les sources du dépôt : après avoir modifié `src/`, relancer `./install.sh` pour que le démon suive.
 
 ### Communication CLI / TUI ↔ démon
 
@@ -101,7 +119,7 @@ Règles de découpage à respecter :
 
 ---
 
-## 4. Layout, mapping et coloration par touche
+## 5. Layout, mapping et coloration par touche
 
 - `EVDEV_TO_LED` mappe les codes evdev (`KEY_SPACE`) vers les positions de LED Gigabyte (`42`). `VALID_POSITIONS` en est l'ensemble trié.
 - `KEY_ALIASES` et `resolve_keys()` résolvent les noms usuels français et anglais, avec ou sans accents : modificateurs (`super`, `ctrl`, `maj`…), navigation (`echap`, `entree`, `suppre`…), directions (`fleches`, `haut`…) et groupes (`wasd`, `zqsd`, `fkeys`, `modifiers`, `nav`, `numpad`, `digits`, `all`).
@@ -116,7 +134,7 @@ Règles de découpage à respecter :
 
 ---
 
-## 5. Héritage en cascade (`inherit`)
+## 6. Héritage en cascade (`inherit`)
 
 Trois étages : **clavier → touche personnalisée → flash**. Chaque niveau reprend la valeur du niveau au-dessus pour chaque champ laissé en `inherit`. L'indicateur de workspace se greffe au-dessus des touches personnalisées, mais ne touche que l'intensité (§ 7).
 
@@ -140,13 +158,14 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
 
 ---
 
-## 6. Boucle de rendu
+## 7. Boucle de rendu
 
 - `run_daemon()` recharge la config, appelle `resolve_lighting()`, puis choisit son mode :
   - **Mode matériel `0x04`** si `Lighting.is_dark` (fond noir *et* aucune touche personnalisée) : le MCU fait tout, 0 % CPU.
   - **Mode matrice** sinon : `hw_brightness` reste calé à `HW_FULL_BRIGHTNESS` (50) et chaque touche est modulée en RGB logiciel.
 - `drain_input()` attend les frappes et renvoie les positions LED pressées ; `MIN_RETRIGGER_DELAY` filtre la répétition clavier, qui donnerait un flash saccadé.
 - `render_frame()` compose la trame des fondus en cours et retire ceux qui sont terminés.
+- **Le démon démarre sans clavier.** `KeyboardController.__init__` avale l'échec de connexion et chaque envoi retente : sur une machine sans le `0414:8007`, le service reste en vie et inerte au lieu de boucler sur des redémarrages, et il prend la main dès que le périphérique apparaît.
 - **Le contrôleur ne lève jamais** : `_send_feature()` et `send_frame()` renvoient un booléen, et `connect()` ne publie son handle qu'une fois ouvert (il en laissait un inutilisable derrière lui en cas d'échec) en ré-énumérant le périphérique, puisque `hidraw` change de numéro après une veille. Un clavier débranché doit être attendu, pas emporter le démon.
 - **L'empreinte enregistre ce que le clavier affiche, pas ce qu'on a voulu lui faire afficher** : un envoi raté la remet à `None` pour être réessayé. De même, rouvrir le périphérique remet l'empreinte à zéro — sans ça, un clavier rebranché restait figé dans son état d'allumage jusqu'au prochain changement de config.
 - `wait_events()` est l'unique `select()` : périphérique evdev, socket d'événements Hyprland et self-pipe des signaux y sont attendus ensemble. Il renvoie `None` quand le clavier a disparu, et la boucle le rouvre après `DEVICE_RETRY_DELAY` au lieu de mourir dans une boucle de redémarrage systemd.
@@ -158,7 +177,7 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
 
 ---
 
-## 7. Intégration Hyprland (indicateur de workspace)
+## 8. Intégration Hyprland (indicateur de workspace)
 
 - `WorkspaceWatcher` suit le workspace actif sur la socket d'événements `$XDG_RUNTIME_DIR/hypr/<signature>/.socket2.sock`, et lit l'état initial via `j/activeworkspace` sur `.socket.sock`.
 - La signature vient de `HYPRLAND_INSTANCE_SIGNATURE` quand systemd l'a importée (c'est le cas sous uwsm), sinon du répertoire d'instance le plus récent : un service utilisateur n'hérite pas toujours de l'environnement du compositeur.
@@ -171,7 +190,7 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
 
 ---
 
-## 8. Console de configuration (`src/aorus_tui.py`)
+## 9. Console de configuration (`src/aorus_tui.py`)
 
 - Lancée par `aorus rgb config`. Bibliothèque standard uniquement (`curses`) : aucune dépendance ajoutée au projet.
 - Structure en menus imbriqués, plus un plan du clavier pour les touches personnalisées et un manuel intégré (`?`).
@@ -186,6 +205,6 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
 
 ---
 
-## 9. Commandes CLI
+## 10. Commandes CLI
 
 `aorus rgb` sans argument affiche l'état complet et la liste à jour des commandes ; le README en donne les exemples. Ne pas recopier cette liste ici, elle se périmerait.

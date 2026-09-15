@@ -35,6 +35,12 @@ OMARCHY_THEME_DIRS = [os.path.expanduser("~/.local/state/omarchy/current/theme")
                       os.path.expanduser("~/.config/omarchy/current/theme")]
 OMARCHY_THEME_FILES = ("keyboard.rgb", "colors.toml")
 SERVICE = "aorus-rgb.service"
+UDEV_RULE = "/etc/udev/rules.d/99-gigabyte-keyboard.rules"
+
+# The Aorus lighting controller. Interface 3 carries the RGB reports; the other
+# interfaces of the same device are the keyboard, mouse and consumer controls.
+KEYBOARD_VID, KEYBOARD_PID = 0x0414, 0x8007
+LIGHTING_INTERFACE = 3
 
 # 101 keys layout mapping (evdev keyname -> Aorus LED position 0..127)
 EVDEV_TO_LED = {
@@ -731,34 +737,110 @@ def get_hw_color_code(rgb):
     return 0x07 # Default White
 
 
-def get_keyboard_hid_path():
-    """Locate keyboard USB controller (0414:8007, interface 3)."""
-    for d in hid.enumerate(0x0414, 0x8007):
-        if d.get("interface_number") == 3:
-            return d["path"]
-    return b"/dev/hidraw3"
+def find_lighting_path():
+    """hidraw path of the lighting interface, or None when it is absent.
 
-
-def get_keyboard_input_device():
-    """Open the keyboard evdev node (0414:8007 input0), or None if it is absent.
-
-    Returning None rather than raising lets the daemon wait for the keyboard to
-    come back (suspend, USB reset) instead of dying into a systemd restart loop.
+    Returning None rather than guessing matters: the old fallback to
+    /dev/hidraw3 would cheerfully write lighting packets into whatever
+    unrelated HID device happened to hold that number.
     """
-    by_id = "/dev/input/by-id/usb-GIGABYTE_USB-HID_Keyboard_AP0000000003-event-kbd"
-    candidates = [by_id] if os.path.exists(by_id) else []
-    candidates += sorted(glob.glob("/dev/input/event*"))
-    for path in candidates:
+    try:
+        entries = hid.enumerate(KEYBOARD_VID, KEYBOARD_PID)
+    except Exception:
+        return None
+    for entry in entries:
+        if entry.get("interface_number") == LIGHTING_INTERFACE:
+            return entry["path"]
+    return None
+
+
+def open_keyboard_input():
+    """Open the keyboard's typing interface, or None if it is absent.
+
+    Matched on USB ids plus a `phys` ending in /input0, which is the interface
+    that reports key presses; the other interfaces of the same device carry the
+    mouse and the consumer controls. Returning None rather than raising lets
+    the daemon wait for the keyboard to come back instead of dying into a
+    systemd restart loop.
+    """
+    for path in sorted(glob.glob("/dev/input/event*")):
         try:
             dev = evdev.InputDevice(path)
         except OSError:
             continue
-        if path == by_id or ("GIGABYTE" in dev.name and
-                             ("8007" in str(dev.phys) or "input0" in str(dev.phys))):
+        info = dev.info
+        if (info.vendor == KEYBOARD_VID and info.product == KEYBOARD_PID
+                and str(dev.phys).endswith("/input0")):
             fcntl.fcntl(dev.fd, fcntl.F_SETFL, os.O_NONBLOCK)
             return dev
         dev.close()
     return None
+
+
+# ----------------- DIAGNOSTICS -----------------
+
+Check = namedtuple("Check", "ok label detail")
+
+SHARE_DIR = os.path.expanduser("~/.local/share/aorus-rgb")
+
+
+def reference_udev_rule():
+    """The rule this version ships, read from the repo or the installed copy."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(here, os.pardir, "udev", "99-gigabyte-keyboard.rules"),
+                 os.path.join(SHARE_DIR, "99-gigabyte-keyboard.rules")):
+        try:
+            with open(path) as f:
+                return f.read()
+        except OSError:
+            continue
+    return None
+
+
+def hardware_checks():
+    """Everything that has to be true for the daemon to drive the keyboard.
+
+    Shared by `aorus rgb doctor` and install.sh so that the answer to "is this
+    machine supported?" is computed in exactly one place.
+    """
+    checks = []
+    device = f"{KEYBOARD_VID:04x}:{KEYBOARD_PID:04x}"
+
+    path = find_lighting_path()
+    checks.append(Check(bool(path), "Contrôleur d'éclairage",
+                        f"{device} interface {LIGHTING_INTERFACE} sur {path.decode() if path else '—'}"
+                        if path else f"aucun périphérique {device} : machine non compatible"))
+    if path:
+        try:
+            handle = hid.device()
+            handle.open_path(path)
+            handle.close()
+            checks.append(Check(True, "Accès au contrôleur", "ouverture en écriture réussie"))
+        except Exception as err:
+            checks.append(Check(False, "Accès au contrôleur",
+                                f"{err} — règle udev absente ou session sans accès local"))
+
+    keyboard = open_keyboard_input()
+    if keyboard:
+        checks.append(Check(True, "Clavier de frappe", f"{keyboard.name} sur {keyboard.path}"))
+        keyboard.close()
+    else:
+        checks.append(Check(False, "Clavier de frappe",
+                            "interface input0 introuvable ou illisible — le flash restera inerte"))
+
+    reference = reference_udev_rule()
+    try:
+        with open(UDEV_RULE) as f:
+            installed = f.read()
+        checks.append(Check(reference is None or installed == reference, "Règle udev",
+                            UDEV_RULE if reference is None or installed == reference
+                            else f"{UDEV_RULE} périmée — relancez ./install.sh"))
+    except OSError:
+        checks.append(Check(False, "Règle udev", f"{UDEV_RULE} absente — relancez ./install.sh"))
+
+    checks.append(Check(is_service_active(), "Service systemd",
+                        SERVICE + (" actif" if is_service_active() else " inactif")))
+    return checks
 
 
 # ----------------- HYPRLAND WORKSPACE WATCHER -----------------
@@ -892,11 +974,16 @@ class KeyboardController:
     """Controls the Aorus keyboard RGB over USB HID."""
 
     def __init__(self):
-        self.dev_path = get_keyboard_hid_path()
+        self.dev_path = None
         self.handle = None
         self.current_mode = None
         self.current_hw_brightness = None
-        self.connect()
+        try:
+            self.connect()
+        except Exception:
+            # No keyboard yet: every send retries the connection, so the daemon
+            # waits for it instead of restarting until one appears.
+            pass
 
     def connect(self):
         """Reopen the lighting interface, re-enumerating first.
@@ -914,7 +1001,9 @@ class KeyboardController:
         self.handle = None
         self.current_mode = None
         self.current_hw_brightness = None
-        self.dev_path = get_keyboard_hid_path()
+        self.dev_path = find_lighting_path()
+        if not self.dev_path:
+            raise OSError(f"contrôleur d'éclairage {KEYBOARD_VID:04x}:{KEYBOARD_PID:04x} introuvable")
         handle = hid.device()
         handle.open_path(self.dev_path)
         self.handle = handle
@@ -1106,7 +1195,7 @@ def run_daemon():
         last_tick = now
 
         if input_dev is None:
-            input_dev = get_keyboard_input_device()
+            input_dev = open_keyboard_input()
             if input_dev is None:
                 time.sleep(DEVICE_RETRY_DELAY)
                 continue

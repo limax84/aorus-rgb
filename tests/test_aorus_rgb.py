@@ -6,9 +6,11 @@ No test framework, no dependency beyond the daemon's own: `python3 tests/test_ao
 The USB and curses layers are not covered here -- they need the real hardware.
 """
 
+import ast
 import copy
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -245,6 +247,41 @@ def test_workspace_events():
     check("et ne laisse pas de workspace périmé", watcher.active is None, watcher.active)
 
 
+def test_device_access():
+    print("accès au périphérique")
+    rule = A.reference_udev_rule()
+    check("la règle udev de référence est trouvable", rule is not None)
+    if rule:
+        # Les commentaires de la règle citent MODE="0666" pour expliquer
+        # pourquoi il est proscrit ; seules les directives comptent.
+        directives = [l for l in rule.splitlines() if l.strip() and not l.startswith("#")]
+        # MODE="0666" sur le nœud event* du clavier, c'est un enregistreur de
+        # frappe offert à tout processus local. La règle d'origine faisait ça.
+        check('aucune directive MODE="0666"', not any("0666" in l for l in directives),
+              "exposerait les frappes à toute application de la machine")
+        check("l'accès passe par uaccess", all("uaccess" in l for l in directives))
+        check("chaque directive est restreinte au 0414:8007",
+              all('idVendor}=="0414"' in l and 'idProduct}=="8007"' in l for l in directives))
+
+    source = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "..", "src", "aorus_rgb.py")).read()
+    # Un numéro de nœud change d'un démarrage à l'autre et un numéro de série ne
+    # vaut que pour un exemplaire : ni l'un ni l'autre n'a sa place dans le code.
+    # Les docstrings qui expliquent pourquoi, et les motifs glob, sont exclus.
+    tree = ast.parse(source)
+    docs = {ast.get_docstring(n, clean=False) for n in ast.walk(tree)
+            if isinstance(n, (ast.Module, ast.FunctionDef, ast.ClassDef))}
+    literals = [n.value.decode("utf-8", "replace") if isinstance(n.value, bytes) else n.value
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, (str, bytes))
+                and n.value not in docs]
+    hardcoded = [v for v in literals if re.search(r"/dev/(?:hidraw|input/event)\d", v)
+                 or "AP0000000003" in v]
+    check("aucun nœud ni numéro de série codé en dur", not hardcoded, hardcoded)
+    check("le contrôleur absent renvoie None, pas un chemin deviné",
+          A.find_lighting_path.__doc__ and "None" in A.find_lighting_path.__doc__)
+
+
 def test_controller_failure():
     print("clavier absent")
 
@@ -255,7 +292,7 @@ def test_controller_failure():
     controller = A.KeyboardController.__new__(A.KeyboardController)
     controller.handle, controller.current_mode = DeadHandle(), "custom"
     controller.current_hw_brightness, controller.dev_path = 50, b"/dev/nonexistent"
-    original, A.get_keyboard_hid_path = A.get_keyboard_hid_path, lambda: b"/dev/nonexistent"
+    original, A.find_lighting_path = A.find_lighting_path, lambda: b"/dev/nonexistent"
     try:
         # Un clavier débranché doit être attendu, pas emporter le démon avec lui.
         check("set_hardware_off signale l'échec sans lever", controller.set_hardware_off() is False)
@@ -266,7 +303,7 @@ def test_controller_failure():
     except Exception as err:
         check("le contrôleur ne lève pas", False, f"{type(err).__name__}: {err}")
     finally:
-        A.get_keyboard_hid_path = original
+        A.find_lighting_path = original
 
 
 # The daemon with its hardware stubbed out: every frame it would send is
@@ -301,7 +338,7 @@ class Watcher:
         except OSError: new = None
         changed, self.active = new != self.active, new
         return changed
-A.KeyboardController, A.get_keyboard_input_device, A.WorkspaceWatcher = Controller, Keyboard, Watcher
+A.KeyboardController, A.open_keyboard_input, A.WorkspaceWatcher = Controller, Keyboard, Watcher
 A.run_daemon()
 """
 
@@ -371,7 +408,8 @@ def test_reload_latency():
 
 def main():
     for test in (test_inheritance, test_fade_duration, test_workspace, test_theme,
-                 test_workspace_events, test_controller_failure, test_reload_latency,
+                 test_workspace_events, test_device_access, test_controller_failure,
+                 test_reload_latency,
                  test_hostile_config, test_config_store):
         test()
     print(f"\n{len(FAILURES)} échec(s)" + (f" : {', '.join(FAILURES)}" if FAILURES else ""))

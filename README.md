@@ -20,6 +20,24 @@ Contrôleur de rétroéclairage et effet réactif touche-par-touche pour ordinat
 
 ---
 
+## 🔌 Compatibilité
+
+Ce projet pilote un contrôleur précis : le **Gigabyte `0414:8007`**, présent sur
+certains portables Aorus (développé et testé sur un **Aorus 17X**). Il ne
+fonctionne pas sur d'autres claviers RGB.
+
+Pour savoir si votre machine est concernée, avant même d'installer :
+
+```bash
+lsusb | grep 0414:8007        # une ligne = contrôleur présent
+```
+
+Il faut par ailleurs Linux avec **systemd** (service utilisateur) et **udev**
+(accès au périphérique sans root). L'indicateur de workspace demande en plus
+**Hyprland** ; tout le reste fonctionne sans.
+
+---
+
 ## 📦 Installation
 
 ```bash
@@ -28,9 +46,43 @@ cd aorus-rgb
 ./install.sh
 ```
 
-Le script installe les dépendances Python (`hidapi`, `evdev`), la règle udev donnant accès au périphérique sans root, le démon, les commandes `aorus` et `aorus-rgb`, puis active le service systemd utilisateur.
+Le script est **idempotent** : relancez-le après un `git pull`, il met à jour ce
+qui a changé. Il installe les dépendances Python (`hidapi`, `evdev`), la règle
+udev donnant accès au périphérique sans root, le démon et la console, les
+commandes `aorus` et `aorus-rgb`, puis active le service systemd utilisateur.
+Il demande `sudo` **une fois**, uniquement pour poser la règle udev.
 
-Désinstallation : `./uninstall.sh`.
+Il termine par un diagnostic, que vous pouvez relancer à tout moment :
+
+```bash
+aorus rgb doctor
+```
+
+```
+  ✓ Contrôleur d'éclairage  0414:8007 interface 3 sur /dev/hidraw3
+  ✓ Accès au contrôleur     ouverture en écriture réussie
+  ✓ Clavier de frappe       GIGABYTE USB-HID Keyboard sur /dev/input/event6
+  ✓ Règle udev              /etc/udev/rules.d/99-gigabyte-keyboard.rules
+  ✓ Service systemd         aorus-rgb.service actif
+```
+
+Chaque ligne fausse est accompagnée du correctif. Si la règle udev vient d'être
+posée, rebranchez le clavier ou redémarrez pour qu'elle s'applique.
+
+Désinstallation : `./uninstall.sh` (retire aussi la règle udev ; vos réglages
+restent dans `~/.config/aorus-rgb`).
+
+### 🔒 Accès au périphérique
+
+La règle udev accorde l'accès via `TAG+="uaccess"`, c'est-à-dire une ACL pour
+l'utilisateur de la session locale active — la façon normale de partager un
+périphérique d'entrée.
+
+> **Mise à jour importante.** Les versions antérieures à cette règle utilisaient
+> `MODE="0666"`, qui donnait le même accès à **tout processus local** : sur le
+> nœud `event*` du clavier, n'importe quel programme pouvait lire toutes les
+> frappes, mots de passe compris. Si vous avez installé le projet avant, relancez
+> `./install.sh` : il compare la règle en place et la remplace.
 
 ---
 
@@ -193,9 +245,53 @@ touche personnalisée — c'est l'étage le plus haut de la cascade.
 ### Service
 
 ```bash
-aorus rgb restart
+aorus rgb status                  # État du clavier
+aorus rgb doctor                  # Matériel, permissions, service
+aorus rgb restart                 # Redémarre le démon
 systemctl --user status aorus-rgb.service
+journalctl --user -u aorus-rgb.service -f
 ```
+
+---
+
+## 🩺 Dépannage
+
+| Symptôme | Cause probable | Correctif |
+|---|---|---|
+| `aorus rgb doctor` : contrôleur absent | machine non équipée du `0414:8007` | `lsusb \| grep 0414` pour confirmer ; le projet ne peut rien faire |
+| `doctor` : accès au contrôleur refusé | règle udev absente ou non appliquée | `./install.sh`, puis rebranchez le clavier ou redémarrez |
+| `doctor` : règle udev périmée | règle d'une version antérieure | `./install.sh` la remplace |
+| Le clavier ne réagit pas | service arrêté | `aorus rgb restart`, puis `journalctl --user -u aorus-rgb.service` |
+| Le flash ne part pas | clavier de frappe illisible | `doctor` le signale ; règle udev, ou appartenance au groupe `input` |
+| `aorus : commande introuvable` | `~/.local/bin` hors du `PATH` | ajoutez-le à votre shell |
+| Workspace « Hyprland injoignable » | pas sous Hyprland, ou session non détectée | fonctionnalité optionnelle ; le reste marche |
+
+Le démon **n'a pas besoin du clavier pour démarrer** : s'il est absent ou
+débranché, il attend et reprend dès son retour, sans boucler sur des
+redémarrages.
+
+---
+
+## 🧑‍💻 Développement
+
+```bash
+git clone https://github.com/limax84/aorus-rgb.git && cd aorus-rgb
+python3 tests/test_aorus_rgb.py        # aucune dépendance en plus, aucun matériel requis
+./bin/aorus-rgb status                 # la CLI du dépôt prime sur la copie installée
+```
+
+`bin/aorus-rgb` place les sources du dépôt avant `~/.local/share/aorus-rgb` dans
+`sys.path` : lancée depuis le dépôt, la commande exécute **le code que vous êtes
+en train de modifier**. Le démon, lui, tourne sur la copie installée — après
+avoir touché à `src/`, relancez `./install.sh` pour qu'il en tienne compte.
+
+La suite de tests couvre la cascade d'héritage, l'indicateur de workspace, le
+thème, l'analyse des événements Hyprland, la réactivité du démon et les
+invariants de la configuration. Les couches USB et curses en sont absentes :
+elles demandent le vrai matériel et un vrai terminal.
+
+Les détails du protocole USB, du mapping des touches et des règles d'héritage
+sont dans [AGENTS.md](AGENTS.md).
 
 ---
 

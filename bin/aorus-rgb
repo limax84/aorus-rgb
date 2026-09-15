@@ -21,8 +21,9 @@ from aorus_rgb import (
     PRESET_KEYS, delete_preset, describe_preset, fmt_brightness, fmt_color,
     group_custom_keys, is_inherit, is_service_active, list_presets, load_config,
     notify_daemon, parse_brightness_arg, parse_color, parse_color_arg,
-    active_workspace, get_theme_accent_color, preset_exists, read_preset,
-    resolve_keys, resolve_lighting, restart_service, update_config, write_preset,
+    active_workspace, get_theme_accent_color, hardware_checks, preset_exists,
+    read_preset, resolve_keys, resolve_lighting, restart_service, update_config,
+    write_preset,
 )
 
 GREEN, RED, DIM, CYAN, RESET = "\033[1;32m", "\033[1;31m", "\033[1;30m", "\033[1;36m", "\033[0m"
@@ -88,6 +89,26 @@ def fmt_workspace(cfg, light, workspace):
                     f"({fmt_brightness(cfg.get('workspace_brightness', 10))})") + RESET
 
 
+def cmd_doctor():
+    """Report whether this machine can actually be driven, and what is missing."""
+    checks = hardware_checks()
+    print(RULE)
+    print(" Diagnostic Aorus RGB")
+    print(" " + "─" * 60)
+    for check in checks:
+        mark = GREEN + "✓" + RESET if check.ok else RED + "✗" + RESET
+        print(f"  {mark} {check.label:<24}{check.detail}")
+    print(RULE)
+    if all(c.ok for c in checks):
+        print("Tout est en place.")
+        return
+    print("Correctifs :")
+    print("  • matériel non détecté  : ce contrôleur n'équipe que certains portables Aorus.")
+    print("  • règle udev            : ./install.sh (demande sudo), puis rebranchez ou redémarrez.")
+    print("  • service inactif       : systemctl --user start aorus-rgb.service")
+    sys.exit(1)
+
+
 def cmd_on():
     cfg = load_config()
     changes = {"backlight": True}
@@ -120,26 +141,48 @@ def cmd_brightness(val_str):
         changes["backlight"] = True
     apply(changes, f"✓ Intensité du rétroéclairage réglée à {val}/10.")
 
-def cmd_flash_brightness(val_str):
-    val = parse_brightness_arg(val_str)
-    if val is None:
-        print("Erreur: L'intensité du flash doit être comprise entre 0 et 10, ou 'inherit'.")
+def set_color_setting(field, value, label, inherit_hint, extra=None):
+    """Write one colour setting, or explain why the value was rejected."""
+    color = parse_color_arg(value)
+    if color is None:
+        print(f"Erreur: Couleur '{value}' non reconnue.")
+        print("Exemples: inherit, theme, white, yellow, cyan, red, 028391, '#ffffff'")
         return
-    changes = {"flash_brightness": val}
-    if val != 0:
-        changes["flash"] = True
-    desc = "INHERIT (hérite de l'intensité de chaque touche)" if val == "inherit" else f"{val}/10"
-    apply(changes, f"✓ Intensité du flash réglée sur {desc}.")
+    shown = f"INHERIT ({inherit_hint})" if color == "inherit" else str(color)
+    apply({field: color, **(extra or {})}, f"✓ Couleur {label} réglée sur {shown}.")
+
+
+def set_brightness_setting(field, value, label, inherit_hint, extra=None):
+    """Write one brightness setting, or explain why the value was rejected."""
+    level = parse_brightness_arg(value)
+    if level is None:
+        print(f"Erreur: Intensité '{value}' invalide. Attendu 0 à 10, ou 'inherit'.")
+        return
+    shown = f"INHERIT ({inherit_hint})" if level == "inherit" else f"{level}/10"
+    apply({field: level, **(extra or {})}, f"✓ Intensité {label} réglée sur {shown}.")
+
+
+def cmd_flash_brightness(val_str):
+    # Une intensité nulle éteint le flash : ce n'est pas le moment de le rallumer.
+    extra = {} if parse_brightness_arg(val_str) == 0 else {"flash": True}
+    set_brightness_setting("flash_brightness", val_str, "du flash",
+                           "hérite de l'intensité de chaque touche", extra)
 
 
 def cmd_flash_color(color_str):
-    col = parse_color_arg(color_str)
-    if col is None:
-        print(f"Erreur: Couleur '{color_str}' non reconnue.")
-        print("Exemples: inherit, white, yellow, cyan, red, 028391, '#ffffff'")
-        return
-    desc = "INHERIT (hérite de la couleur de chaque touche)" if col == "inherit" else str(col)
-    apply({"flash_color": col, "flash": True}, f"✓ Couleur du flash réglée sur {desc}.")
+    set_color_setting("flash_color", color_str, "du flash",
+                      "hérite de la couleur de chaque touche", {"flash": True})
+
+
+def cmd_workspace_color(color_str):
+    set_color_setting("workspace_color", color_str, "du workspace actif",
+                      "garde la couleur de la touche", {"workspace_key": True})
+
+
+def cmd_workspace_brightness(val_str):
+    set_brightness_setting("workspace_brightness", val_str, "du workspace actif",
+                           "garde l'intensité de la touche", {"workspace_key": True})
+
 
 def cmd_flash(args):
     if not args:
@@ -370,27 +413,6 @@ def cmd_preset(args):
 
 # ----------------- WORKSPACE INDICATOR -----------------
 
-def cmd_workspace_color(color_str):
-    col = parse_color_arg(color_str)
-    if col is None:
-        print(f"Erreur: Couleur '{color_str}' non reconnue.")
-        print("Exemples: inherit, white, cyan, theme, 028391, '#ffffff'")
-        return
-    desc = "INHERIT (garde la couleur de la touche)" if col == "inherit" else str(col)
-    apply({"workspace_color": col, "workspace_key": True},
-          f"✓ Couleur du workspace actif réglée sur {desc}.")
-
-
-def cmd_workspace_brightness(val_str):
-    val = parse_brightness_arg(val_str)
-    if val is None:
-        print("Usage: aorus rgb workspace brightness <0-10|inherit>")
-        return
-    desc = "INHERIT (garde l'intensité de la touche)" if val == "inherit" else f"{val}/10"
-    apply({"workspace_brightness": val, "workspace_key": True},
-          f"✓ Intensité du workspace actif réglée sur {desc}.")
-
-
 def cmd_workspace(args):
     """Highlight the digit key of the active Hyprland workspace."""
     cfg = load_config()
@@ -436,7 +458,7 @@ Commandes disponibles :
   aorus rgb workspace on | off           - Éclaire le chiffre du workspace actif
   aorus rgb workspace color <couleur|inherit>
   aorus rgb workspace brightness <0-10|inherit> | dark [on|off]
-  aorus rgb status | restart
+  aorus rgb status | doctor | restart
 
 'inherit' (ou 'auto', 'null', vide) hérite du niveau au-dessus.
 Cascade : clavier -> touche personnalisée -> flash."""
@@ -487,6 +509,8 @@ def main():
         cmd_workspace(rest)
     elif sub == "status":
         cmd_status()
+    elif sub in ("doctor", "diag"):
+        cmd_doctor()
     elif sub == "restart":
         restart_service()
         cmd_status()

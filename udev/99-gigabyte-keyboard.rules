@@ -1,4 +1,16 @@
-# Gigabyte Aorus Keyboard Controller permissions (0414:8007, 0414:8010, etc.)
-KERNEL=="hidraw*", ATTRS{idVendor}=="0414", MODE="0666"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0414", MODE="0666"
-KERNEL=="event*", ATTRS{idVendor}=="0414", MODE="0666"
+# Gigabyte Aorus RGB keyboard controller (0414:8007).
+#
+# TAG+="uaccess" hands an ACL to the user of the active local session, which is
+# how input devices are meant to be shared. MODE="0666" would give the same
+# access to every local process -- on the evdev node that means any program on
+# the machine could read every keystroke, passwords included.
+#
+# Matching is narrowed to the lighting controller's own vendor:product so that
+# nothing else on the bus is touched.
+
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0414", ATTRS{idProduct}=="8007", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="0414", ATTRS{idProduct}=="8007", TAG+="uaccess"
+
+# Only needed where python-hidapi is built against the libusb backend rather
+# than hidraw; harmless otherwise.
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0414", ATTRS{idProduct}=="8007", TAG+="uaccess"
