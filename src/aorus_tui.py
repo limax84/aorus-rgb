@@ -14,7 +14,7 @@ from aorus_rgb import (
     fmt_brightness, fmt_color, is_service_active, list_presets, load_config,
     notify_daemon, parse_brightness_arg, parse_color_arg, preset_exists,
     read_preset, resolve_keys, resolve_lighting, restart_service, save_config,
-    write_preset,
+    update_config, write_preset,
 )
 
 # Physical layout, row by row. Each cell is (evdev name, 3-char label); None is
@@ -125,20 +125,28 @@ class Console:
     # --- config plumbing -------------------------------------------------
 
     def commit(self, changes, message=""):
-        """Save a change and hand it to the daemon straight away."""
+        """Save a change and hand it to the daemon straight away.
+
+        Only the changed fields are written, on top of the config as it is on
+        disk right now: the CLI may have written since this console loaded, and
+        saving our whole in-memory copy would silently undo it.
+        """
         self.history.append(dict(self.cfg))
         del self.history[:-30]
-        self.cfg.update(changes)
-        save_config(self.cfg)
+        self.cfg = update_config(changes)
         notify_daemon()
         self.message = message
 
+    def reload(self):
+        """Pick up changes made outside the console, between two keystrokes."""
+        self.cfg = load_config()
+
     def undo(self):
+        """Restore the previous state. Unlike commit, this writes it whole."""
         if not self.history:
             self.message = "Rien à annuler."
             return
-        self.cfg = self.history.pop()
-        save_config(self.cfg)
+        self.cfg = save_config(self.history.pop())
         notify_daemon()
         self.message = "Annulé."
 
@@ -206,6 +214,7 @@ class Console:
         """
         index = 0
         while True:
+            self.reload()
             rows = items(self) if callable(items) else items
             index = max(0, min(index, len(rows) - 1))
             top = self.frame(title)
@@ -439,6 +448,7 @@ def screen_keys(console):
         return sorted(marks) if marks else [current()]
 
     while True:
+        console.reload()
         light = console.lighting()
         top = console.frame(
             "Touches personnalisées",

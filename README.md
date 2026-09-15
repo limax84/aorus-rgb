@@ -49,6 +49,9 @@ organisée en menus — rétroéclairage, flash, touches, presets, intégration 
 **chaque modification part vers le clavier immédiatement** : le vrai clavier est
 l'aperçu. `u` annule la dernière action, `q` revient en arrière puis quitte.
 
+La console et la ligne de commande peuvent servir en même temps : chacune n'écrit
+que ce qu'elle change, et la console affiche en direct ce que l'autre a fait.
+
 L'entrée « Touches personnalisées » ouvre un plan du clavier où chaque touche
 s'affiche dans sa couleur réelle :
 
