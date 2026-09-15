@@ -94,7 +94,8 @@ Règles de découpage à respecter :
 ### Invariants de la config — à ne pas casser
 
 - **`save_config()` écrit dans un fichier temporaire puis `os.replace()`.** Le démon relit ce fichier pendant que la CLI l'écrit ; une écriture en place lui ferait lire du JSON tronqué.
-- **`load_config()` ne réécrit jamais un fichier qu'il n'a pas su lire.** L'ancienne version retombait sur `save_config(DEFAULT_CONFIG)` en cas d'erreur de lecture : une seule lecture malheureuse effaçait toutes les touches personnalisées de l'utilisateur.
+- **`read_config()` ne réécrit jamais un fichier qu'il n'a pas su lire** et renvoie `(config, readable)`. L'ancienne version retombait sur `save_config(DEFAULT_CONFIG)` en cas d'erreur de lecture : une seule lecture malheureuse effaçait toutes les touches personnalisées.
+- **`update_config()` met un fichier illisible de côté (`config.json.corrupt`) au lieu de l'écraser.** Sans ce test, la lecture-fusion-écriture réécrivait les défauts par-dessus et détruisait exactement ce que `read_config()` refuse de détruire : une commande CLI quelconque remettait tout à zéro en silence.
 - **`load_config()` normalise `custom_keys`** : un fichier édité à la main peut contenir n'importe quoi, et un mauvais type faisait planter le démon en boucle de redémarrage systemd. On nettoie à l'entrée plutôt qu'à chaque usage ; `resolve_key_settings()` garde tout de même son test de type, puisqu'on l'appelle aussi sur des configs construites à la main.
 - `save_config()` filtre sur les clés de `DEFAULT_CONFIG` : les réglages devenus obsolètes disparaissent d'eux-mêmes, et une clé inconnue ne survit pas à un enregistrement.
 
@@ -146,6 +147,8 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
   - **Mode matrice** sinon : `hw_brightness` reste calé à `HW_FULL_BRIGHTNESS` (50) et chaque touche est modulée en RGB logiciel.
 - `drain_input()` attend les frappes et renvoie les positions LED pressées ; `MIN_RETRIGGER_DELAY` filtre la répétition clavier, qui donnerait un flash saccadé.
 - `render_frame()` compose la trame des fondus en cours et retire ceux qui sont terminés.
+- **Le contrôleur ne lève jamais** : `_send_feature()` et `send_frame()` renvoient un booléen, et `connect()` ne publie son handle qu'une fois ouvert (il en laissait un inutilisable derrière lui en cas d'échec) en ré-énumérant le périphérique, puisque `hidraw` change de numéro après une veille. Un clavier débranché doit être attendu, pas emporter le démon.
+- **L'empreinte enregistre ce que le clavier affiche, pas ce qu'on a voulu lui faire afficher** : un envoi raté la remet à `None` pour être réessayé. De même, rouvrir le périphérique remet l'empreinte à zéro — sans ça, un clavier rebranché restait figé dans son état d'allumage jusqu'au prochain changement de config.
 - `wait_events()` est l'unique `select()` : périphérique evdev, socket d'événements Hyprland et self-pipe des signaux y sont attendus ensemble. Il renvoie `None` quand le clavier a disparu, et la boucle le rouvre après `DEVICE_RETRY_DELAY` au lieu de mourir dans une boucle de redémarrage systemd.
 - **Reprise de veille** : une itération plus longue que `SUSPEND_GAP` signifie qu'on sort de suspension. Le contrôleur est reconnecté et l'empreinte remise à `None`, ce qui force le réenvoi d'une trame — sans cela le clavier restait sur l'état que le MCU avait perdu.
 - Les constantes de la boucle (`CONFIG_POLL_INTERVAL`, `IDLE_TIMEOUT`, `FADE_TIMEOUT`, `MIN_RETRIGGER_DELAY`, `HW_FULL_BRIGHTNESS`, `SUSPEND_GAP`, `DEVICE_RETRY_DELAY`) sont regroupées en tête de `src/aorus_rgb.py`.
@@ -161,8 +164,9 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
 - La signature vient de `HYPRLAND_INSTANCE_SIGNATURE` quand systemd l'a importée (c'est le cas sous uwsm), sinon du répertoire d'instance le plus récent : un service utilisateur n'hérite pas toujours de l'environnement du compositeur.
 - Événements pris en compte : `workspace>>`, `workspacev2>>` et `focusedmon>>`. Le watcher se reconnecte tout seul si Hyprland redémarre, et reste inerte hors Hyprland.
 - `workspace_led_pos()` fait correspondre le **nom** du workspace à la touche chiffre : `3` → `KEY_3`, et `10` → `KEY_0`, parce que le binding Omarchy est `SUPER + code:N` sur `1..9` puis `0`. Un workspace nommé (`Work`) n'allume rien.
-- L'indicateur se règle comme le flash : `workspace_color` et `workspace_brightness` écrasent chacun la cascade, ou la laissent passer sur `inherit`. Par défaut `workspace_color` vaut `inherit`, donc la touche garde sa couleur et ne fait que monter en intensité. Une couleur explicite écrase aussi une touche personnalisée — c'est l'étage le plus haut.
+- L'indicateur se règle comme le flash : `workspace_color` et `workspace_brightness` écrasent chacun la cascade, ou la laissent passer sur `inherit` — l'intensité héritée est **celle de la touche**, pas 10. Par défaut `workspace_color` vaut `inherit`, donc la touche garde sa couleur et ne fait que monter en intensité. Une couleur explicite écrase aussi une touche personnalisée — c'est l'étage le plus haut.
 - Il n'est jamais écrit dans `custom_keys` : c'est un étage calculé au rendu, sinon les presets et la config se pollueraient à chaque bascule.
+- Le workspace actif n'entre dans l'empreinte de la boucle **que si `workspace_key` est vrai** : sinon chaque bascule couperait le fondu en cours et ré-armerait le mode matériel pour rien (`test_reload_latency` le vérifie).
 - Sur un clavier éteint, l'indicateur est **abandonné** pour préserver le mode matériel à 0 % CPU, sauf si `workspace_dark` est vrai : cette option assume explicitement le passage en mode matrice.
 
 ---

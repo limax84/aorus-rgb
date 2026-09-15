@@ -258,8 +258,9 @@ def resolve_key_settings(cfg, raw_bg, global_b, ws_pos=None):
 
     if ws_pos in settings:
         ws_color = parse_color(cfg.get("workspace_color"), default=None)
-        settings[ws_pos] = (tuple(ws_color) if ws_color is not None else settings[ws_pos][0],
-                            resolve_brightness(cfg.get("workspace_brightness"), 10))
+        key_color, key_brightness = settings[ws_pos]
+        settings[ws_pos] = (tuple(ws_color) if ws_color is not None else key_color,
+                            resolve_brightness(cfg.get("workspace_brightness"), key_brightness))
     return settings
 
 
@@ -383,22 +384,21 @@ def resolve_lighting(cfg, workspace=None):
     )
 
 
-def load_config():
-    """Load the config on top of the defaults, dropping keys we no longer know.
+def read_config():
+    """Load the config on top of the defaults. Returns (config, readable).
 
-    A file we failed to read is never overwritten: the daemon polls this path
-    while the CLI writes it, and a config wiped by a bad read would cost the
-    user every custom key they had set.
+    `readable` is False when a file exists but could not be parsed. Nothing is
+    written here: the daemon polls this path while the CLI writes it, and a
+    config wiped by a bad read would cost the user every custom key they set.
     """
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     try:
         with open(CONFIG_FILE, "r") as f:
             stored = json.load(f)
     except FileNotFoundError:
-        save_config(cfg)
-        return cfg
+        return cfg, True
     except (OSError, ValueError):
-        return cfg
+        return cfg, False
     if isinstance(stored, dict):
         cfg.update({k: v for k, v in stored.items() if k in DEFAULT_CONFIG})
     # A hand-edited file can hold anything. Normalizing here rather than at
@@ -406,6 +406,14 @@ def load_config():
     keys = cfg.get("custom_keys")
     cfg["custom_keys"] = ({k: v for k, v in keys.items() if isinstance(v, dict)}
                           if isinstance(keys, dict) else {})
+    return cfg, True
+
+
+def load_config():
+    """The stored config, merged over the defaults."""
+    cfg, _ = read_config()
+    if not os.path.exists(CONFIG_FILE):
+        save_config(cfg)
     return cfg
 
 
@@ -424,8 +432,18 @@ def save_config(cfg):
 
 
 def update_config(changes):
-    """Apply changes to the stored config and return the result."""
-    cfg = load_config()
+    """Apply changes to the stored config and return the result.
+
+    A file we could not parse is moved aside rather than overwritten: writing
+    the defaults on top of it would destroy exactly what read_config() refuses
+    to destroy, and the user's command would silently reset everything.
+    """
+    cfg, readable = read_config()
+    if not readable:
+        try:
+            os.replace(CONFIG_FILE, CONFIG_FILE + ".corrupt")
+        except OSError:
+            pass
     cfg.update(changes)
     return save_config(cfg)
 
@@ -779,12 +797,17 @@ class WorkspaceWatcher:
         sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
         if sig and os.path.isdir(os.path.join(base, sig)):
             return os.path.join(base, sig)
-        dirs = [d for d in glob.glob(os.path.join(base, "*")) if os.path.isdir(d)]
-        return max(dirs, key=os.path.getmtime) if dirs else None
+        try:
+            dirs = [d for d in glob.glob(os.path.join(base, "*")) if os.path.isdir(d)]
+            return max(dirs, key=os.path.getmtime) if dirs else None
+        except OSError:
+            # Hyprland exiting can remove the directory between the two calls.
+            return None
 
     def connect(self):
         """Attach to the event socket and read the current workspace once."""
         self.close()
+        self.active = None
         self.next_retry = time.time() + DEVICE_RETRY_DELAY
         path = self._socket_dir()
         if not path:
@@ -813,8 +836,11 @@ class WorkspaceWatcher:
                     if not chunk:
                         break
                     chunks.append(chunk)
-            return str(json.loads(b"".join(chunks)).get("name"))
-        except (OSError, ValueError):
+            name = json.loads(b"".join(chunks)).get("name")
+            # str(None) would be the truthy string "None", lighting a digit key
+            # for a workspace that does not exist.
+            return None if name is None else str(name)
+        except (OSError, ValueError, AttributeError):
             return None
 
     def close(self):
@@ -844,6 +870,7 @@ class WorkspaceWatcher:
             data = b""
         if not data:            # Hyprland went away; retry later
             self.close()
+            self.active = None  # never keep a stale digit lit under no compositor
             self.next_retry = time.time() + DEVICE_RETRY_DELAY
             return False
 
@@ -872,15 +899,25 @@ class KeyboardController:
         self.connect()
 
     def connect(self):
+        """Reopen the lighting interface, re-enumerating first.
+
+        The handle is only published once it is actually open: assigning it
+        before open_path() left a truthy but unusable handle behind on failure.
+        The path is looked up again every time, since hidraw renumbers across a
+        suspend or a USB reset.
+        """
         if self.handle:
             try:
                 self.handle.close()
             except Exception:
                 pass
-        self.handle = hid.device()
-        self.handle.open_path(self.dev_path)
+        self.handle = None
         self.current_mode = None
         self.current_hw_brightness = None
+        self.dev_path = get_keyboard_hid_path()
+        handle = hid.device()
+        handle.open_path(self.dev_path)
+        self.handle = handle
 
     @staticmethod
     def _packet(*payload):
@@ -888,26 +925,38 @@ class KeyboardController:
         return bytes([0x00, *payload, (0xFF - sum(payload)) & 0xFF])
 
     def _send_feature(self, pkt):
-        """Send a feature report, reconnecting once if the handle went stale."""
-        if not self.handle:
-            self.connect()
-        try:
-            self.handle.send_feature_report(pkt)
-        except Exception:
-            self.connect()
-            self.handle.send_feature_report(pkt)
+        """Send a feature report, reconnecting once if the handle went stale.
+
+        Returns False rather than raising: a keyboard that went away must be
+        waited for, not allowed to take the daemon down with it.
+        """
+        for _ in range(2):
+            try:
+                if not self.handle:
+                    self.connect()
+                self.handle.send_feature_report(pkt)
+                return True
+            except Exception:
+                self.handle = None
+                self.current_mode = None
+        return False
 
     def set_hardware_reactive(self, brightness_byte=50, color_code=0x07):
         """Native hardware reactive mode (0x04). Runs at 1000 Hz on the MCU, 0 CPU."""
-        self._send_feature(self._packet(0x08, 0x00, 0x04, 0x01, brightness_byte, color_code, 0x01))
+        if not self._send_feature(
+                self._packet(0x08, 0x00, 0x04, 0x01, brightness_byte, color_code, 0x01)):
+            return False
         self.current_mode = "reactive"
         self.current_hw_brightness = brightness_byte
+        return True
 
     def set_hardware_off(self):
         """Turn all keyboard lights off."""
-        self._send_feature(self._packet(0x08, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01))
+        if not self._send_feature(self._packet(0x08, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01)):
+            return False
         self.current_mode = "off"
         self.current_hw_brightness = 0
+        return True
 
     def enter_custom_mode(self, hw_brightness=50):
         """Switch to per-key matrix mode (0x33).
@@ -915,14 +964,18 @@ class KeyboardController:
         Must be sent only on an actual mode change: re-sending it every frame
         resets the MCU lighting engine and makes the keyboard stutter.
         """
-        self._send_feature(self._packet(0x08, 0x00, 0x33, 0x01, hw_brightness, 0x05, 0x01))
+        if not self._send_feature(
+                self._packet(0x08, 0x00, 0x33, 0x01, hw_brightness, 0x05, 0x01)):
+            return False
         self.current_mode = "custom"
         self.current_hw_brightness = hw_brightness
+        return True
 
     def send_frame(self, key_rgb, hw_brightness=50):
-        """Send one per-key frame (report 0x12, 8 chunks of 64 bytes)."""
+        """Send one per-key frame (report 0x12, 8 chunks of 64 bytes). Returns success."""
         if self.current_mode != "custom" or self.current_hw_brightness != hw_brightness:
-            self.enter_custom_mode(hw_brightness)
+            if not self.enter_custom_mode(hw_brightness):
+                return False
 
         color_data = bytearray(512)
         for pos, (r, g, b) in key_rgb.items():
@@ -943,13 +996,16 @@ class KeyboardController:
         except Exception:
             try:
                 self.connect()
-                self.enter_custom_mode(hw_brightness)
+                if not self.enter_custom_mode(hw_brightness):
+                    return False
                 _write_frame()
             except Exception:
+                self.handle = None
                 self.current_mode = None
-                return
+                return False
         self.current_mode = "custom"
         self.current_hw_brightness = hw_brightness
+        return True
 
 
 def drain_input(input_dev):
@@ -1054,6 +1110,8 @@ def run_daemon():
             if input_dev is None:
                 time.sleep(DEVICE_RETRY_DELAY)
                 continue
+            # A keyboard that just came back has lost whatever the MCU held.
+            fingerprint = None
 
         if now - last_reload > CONFIG_POLL_INTERVAL:
             cfg, last_reload = load_config(), now
@@ -1062,10 +1120,13 @@ def run_daemon():
             cfg_state = json.dumps(cfg, sort_keys=True)
             theme = theme_stamp(cfg_state)
 
-        current = (cfg_state, workspaces.active, theme)
+        # The active workspace only belongs in the fingerprint when it can
+        # change the picture; otherwise every switch would cut a running fade
+        # and re-arm the hardware mode for nothing.
+        current = (cfg_state, workspaces.active if cfg.get("workspace_key") else None, theme)
         changed = current != fingerprint
         if changed:
-            light, fingerprint = resolve_lighting(cfg, workspaces.active), current
+            light = resolve_lighting(cfg, workspaces.active)
             active_fades.clear()
 
         flash_on = light.flash and light.flash_brightness > 0
@@ -1075,16 +1136,20 @@ def run_daemon():
         if light.is_dark:
             if changed:
                 if flash_on:
-                    controller.set_hardware_reactive(
+                    applied = controller.set_hardware_reactive(
                         brightness_byte=max(5, min(50, light.flash_brightness * 5)),
                         color_code=get_hw_color_code(light.hw_flash_color))
                 else:
-                    controller.set_hardware_off()
+                    applied = controller.set_hardware_off()
+                # The fingerprint records what the keyboard shows, not what we
+                # meant it to show: a failed send must be retried, not forgotten.
+                fingerprint = current if applied else None
             timeout = IDLE_TIMEOUT
         else:
             # Colored background, custom keys or workspace indicator: matrix mode.
             if changed:
-                controller.send_frame(light.base_map, hw_brightness=HW_FULL_BRIGHTNESS)
+                fingerprint = current if controller.send_frame(
+                    light.base_map, hw_brightness=HW_FULL_BRIGHTNESS) else None
             timeout = FADE_TIMEOUT if (flash_on and active_fades) else IDLE_TIMEOUT
 
         pressed, signalled = wait_events(input_dev, workspaces, wake_fd, timeout)

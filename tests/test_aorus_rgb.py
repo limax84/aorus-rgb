@@ -92,6 +92,12 @@ def test_workspace():
     check("une couleur illisible retombe sur la cascade",
           A.resolve_lighting(dict(cfg, workspace_color="pas-une-couleur"),
                              "3").base_map[pos("KEY_3")] == (0, 220, 255))
+    inherited = dict(cfg, workspace_brightness="inherit")
+    check("workspace_brightness 'inherit' garde l'intensité de la touche",
+          A.resolve_lighting(inherited, "3").base_map[pos("KEY_3")] == A.scale_color((0, 220, 255), 2))
+    check("et celle d'une touche personnalisée",
+          A.resolve_lighting(dict(inherited, custom_keys={"KEY_3": {"color": [255, 0, 0], "brightness": 8}}),
+                             "3").base_map[pos("KEY_3")] == A.scale_color((255, 0, 0), 8))
     check("le workspace 10 vise la touche 0", A.resolve_lighting(cfg, "10").ws_pos == pos("KEY_0"))
     check("un workspace nommé n'allume rien", A.resolve_lighting(cfg, "Work").ws_pos is None)
     check("désactivé, aucun effet",
@@ -172,6 +178,17 @@ def test_config_store():
           A.load_config()["custom_keys"] == {} and open(A.CONFIG_FILE).read() == corrupt)
 
     A.save_config(precious)
+    with open(A.CONFIG_FILE, "w") as f:
+        f.write(corrupt)
+    A.update_config({"brightness": 7})
+    # Écrire les défauts par-dessus détruirait exactement ce que read_config()
+    # refuse de détruire : le fichier est mis de côté, pas écrasé.
+    check("update_config met l'illisible de côté",
+          open(A.CONFIG_FILE + ".corrupt").read() == corrupt)
+    check("et la commande aboutit quand même",
+          json.load(open(A.CONFIG_FILE))["brightness"] == 7)
+
+    A.save_config(precious)
     check("les clés inconnues sont purgées", "enabled" not in A.update_config({"enabled": True}))
     check("les réglages survivent à l'écriture", len(A.load_config()["custom_keys"]) == 12)
 
@@ -224,6 +241,32 @@ def test_workspace_events():
     select.select([watcher], [], [], 0.5)
     watcher.poll()
     check("la disparition d'Hyprland est gérée", watcher.sock is None)
+    # Garder le dernier workspace laisserait une touche allumée sans compositeur.
+    check("et ne laisse pas de workspace périmé", watcher.active is None, watcher.active)
+
+
+def test_controller_failure():
+    print("clavier absent")
+
+    class DeadHandle:
+        def send_feature_report(self, packet): raise OSError("parti")
+        def close(self): pass
+
+    controller = A.KeyboardController.__new__(A.KeyboardController)
+    controller.handle, controller.current_mode = DeadHandle(), "custom"
+    controller.current_hw_brightness, controller.dev_path = 50, b"/dev/nonexistent"
+    original, A.get_keyboard_hid_path = A.get_keyboard_hid_path, lambda: b"/dev/nonexistent"
+    try:
+        # Un clavier débranché doit être attendu, pas emporter le démon avec lui.
+        check("set_hardware_off signale l'échec sans lever", controller.set_hardware_off() is False)
+        check("send_frame signale l'échec sans lever",
+              controller.send_frame({11: (1, 2, 3)}) is False)
+        check("aucun handle inutilisable ne survit",
+              controller.handle is None and controller.current_mode is None)
+    except Exception as err:
+        check("le contrôleur ne lève pas", False, f"{type(err).__name__}: {err}")
+    finally:
+        A.get_keyboard_hid_path = original
 
 
 # The daemon with its hardware stubbed out: every frame it would send is
@@ -236,6 +279,7 @@ d = sys.argv[1]
 A.CONFIG_DIR, A.CONFIG_FILE, A.PID_FILE = d, os.path.join(d, "config.json"), os.path.join(d, "pid")
 def frame(*a, **k):
     print("FRAME %.4f" % time.time(), flush=True)
+    return True                 # the loop retries whatever reports a failed send
 class Controller:
     current_mode = None
     def connect(self): pass
@@ -248,8 +292,15 @@ class Keyboard:
     def read(self): return []
     def close(self): os.close(self.fd); os.close(self._w)
 class Watcher:
-    sock = active = None
-    def poll(self): return False
+    # Reads the active workspace from a file, so the test can switch it.
+    sock = None
+    def __init__(self): self.active = None
+    def poll(self):
+        try:
+            with open(os.path.join(d, "workspace")) as f: new = f.read().strip() or None
+        except OSError: new = None
+        changed, self.active = new != self.active, new
+        return changed
 A.KeyboardController, A.get_keyboard_input_device, A.WorkspaceWatcher = Controller, Keyboard, Watcher
 A.run_daemon()
 """
@@ -298,6 +349,21 @@ def test_reload_latency():
         seen = next_frame(3 * A.CONFIG_POLL_INTERVAL)
         check("sans signal, le sondage rattrape quand même",
               seen is not None and seen - start < 2.5 * A.CONFIG_POLL_INTERVAL)
+
+        # Une bascule de workspace ne doit rien réémettre quand l'indicateur est
+        # éteint : sinon elle coupe le fondu en cours et ré-arme le mode matériel.
+        for enabled, expected in ((False, 0), (True, 3)):
+            A.save_config(dict(A.load_config(), workspace_key=enabled))
+            os.kill(daemon.pid, signal.SIGUSR1)
+            next_frame(1.0)
+            frames = 0
+            for name in ("2", "3", "4"):
+                with open(os.path.join(directory, "workspace"), "w") as f:
+                    f.write(name)
+                if next_frame(1.0) is not None:
+                    frames += 1
+            check(f"workspace_key={enabled} : {frames} trame(s) sur 3 bascules",
+                  frames == expected, f"attendu {expected}")
     finally:
         daemon.kill()
         daemon.wait()
@@ -305,8 +371,8 @@ def test_reload_latency():
 
 def main():
     for test in (test_inheritance, test_fade_duration, test_workspace, test_theme,
-                 test_workspace_events, test_reload_latency, test_hostile_config,
-                 test_config_store):
+                 test_workspace_events, test_controller_failure, test_reload_latency,
+                 test_hostile_config, test_config_store):
         test()
     print(f"\n{len(FAILURES)} échec(s)" + (f" : {', '.join(FAILURES)}" if FAILURES else ""))
     return 1 if FAILURES else 0

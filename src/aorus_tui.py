@@ -491,6 +491,9 @@ def screen_backlight(console):
         if isinstance(value, int):
             c.commit({"brightness": value, "backlight": value > 0},
                      f"Intensité : {value}/10")
+        elif value is not None:
+            # The keyboard is the top of the cascade: it has nothing to inherit.
+            c.message = "Le rétroéclairage ne peut pas hériter : donnez un nombre de 0 à 10."
 
     def set_fade(c):
         text = c.ask("Durée du fondu en secondes (ex. 0.45) : ")
@@ -567,10 +570,10 @@ def screen_os(console):
                      f"Workspace actif : {fmt_color(color)}")
 
     def set_brightness(c):
-        value = ask_brightness(c, "Intensité du workspace actif (0-10) : ")
-        if isinstance(value, int):
+        value = ask_brightness(c, "Intensité du workspace actif (0-10, inherit) : ")
+        if value is not None:
             c.commit({"workspace_brightness": value, "workspace_key": True},
-                     f"Workspace actif : {value}/10")
+                     f"Workspace actif : {fmt_brightness(value)}")
 
     def restart(c):
         restart_service()

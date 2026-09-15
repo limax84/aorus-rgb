@@ -21,8 +21,8 @@ from aorus_rgb import (
     PRESET_KEYS, delete_preset, describe_preset, fmt_brightness, fmt_color,
     group_custom_keys, is_inherit, is_service_active, list_presets, load_config,
     notify_daemon, parse_brightness_arg, parse_color, parse_color_arg,
-    active_workspace, preset_exists, read_preset, resolve_keys, resolve_lighting,
-    restart_service, update_config, write_preset,
+    active_workspace, get_theme_accent_color, preset_exists, read_preset,
+    resolve_keys, resolve_lighting, restart_service, update_config, write_preset,
 )
 
 GREEN, RED, DIM, CYAN, RESET = "\033[1;32m", "\033[1;31m", "\033[1;30m", "\033[1;36m", "\033[0m"
@@ -73,13 +73,17 @@ def cmd_status():
 
 
 def fmt_workspace(cfg, light, workspace):
-    """Describe the workspace indicator: off, waiting for Hyprland, or lit."""
+    """Describe the workspace indicator: off, unreachable, unlit, or lit."""
     if not cfg.get("workspace_key"):
         return DIM + "Indicateur désactivé" + RESET
     if workspace is None:
         return RED + "Activé, mais Hyprland injoignable" + RESET
     if light.ws_pos is None:
-        return DIM + f"Workspace {workspace} (masqué : clavier éteint)" + RESET
+        # Two different reasons, and telling the user the keyboard is off when
+        # it is merely a named workspace would be plain wrong.
+        cause = ("aucune touche chiffre" if not str(workspace).strip().isdigit()
+                 else "masqué : clavier éteint")
+        return DIM + f"Workspace {workspace} ({cause})" + RESET
     return GREEN + (f"Workspace {workspace} : {fmt_color(cfg.get('workspace_color'))} "
                     f"({fmt_brightness(cfg.get('workspace_brightness', 10))})") + RESET
 
@@ -379,11 +383,12 @@ def cmd_workspace_color(color_str):
 
 def cmd_workspace_brightness(val_str):
     val = parse_brightness_arg(val_str)
-    if not isinstance(val, int):
-        print("Usage: aorus rgb workspace brightness <0-10>")
+    if val is None:
+        print("Usage: aorus rgb workspace brightness <0-10|inherit>")
         return
+    desc = "INHERIT (garde l'intensité de la touche)" if val == "inherit" else f"{val}/10"
     apply({"workspace_brightness": val, "workspace_key": True},
-          f"✓ Intensité du workspace actif réglée à {val}/10.")
+          f"✓ Intensité du workspace actif réglée sur {desc}.")
 
 
 def cmd_workspace(args):
@@ -402,7 +407,7 @@ def cmd_workspace(args):
     elif sub == "color":
         needs_arg("workspace color <inherit|cyan|theme|#hex>", cmd_workspace_color, args[1:])
     elif sub in ("brightness", "intensity"):
-        needs_arg("workspace brightness <0-10>", cmd_workspace_brightness, args[1:])
+        needs_arg("workspace brightness <0-10|inherit>", cmd_workspace_brightness, args[1:])
     elif isinstance(parse_brightness_arg(sub), int):
         cmd_workspace_brightness(sub)      # `aorus rgb workspace 8`
     elif parse_color_arg(sub) is not None:
@@ -430,7 +435,7 @@ Commandes disponibles :
   aorus rgb <nom-de-preset>              - Charge un preset
   aorus rgb workspace on | off           - Éclaire le chiffre du workspace actif
   aorus rgb workspace color <couleur|inherit>
-  aorus rgb workspace brightness <0-10> | dark [on|off]
+  aorus rgb workspace brightness <0-10|inherit> | dark [on|off]
   aorus rgb status | restart
 
 'inherit' (ou 'auto', 'null', vide) hérite du niveau au-dessus.
