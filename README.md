@@ -74,9 +74,15 @@ s'affiche dans sa couleur réelle :
 | `p` | Mode pinceau : on choisit une couleur, puis chaque déplacement peint la touche traversée |
 | `r` | Réinitialiser (retour à la couleur globale) |
 | `u` | Annuler |
+| `?` | Manuel intégré |
 | `q` | Retour au menu |
 
-La console demande un terminal d'au moins 82 × 22.
+`?` ouvre à tout moment un manuel qui reprend les touches de la console, les
+valeurs acceptées, la cascade d'héritage et l'ensemble des commandes de la
+ligne de commande. `Ctrl+C` ferme la console aussi bien que `q`.
+
+Le plan du clavier demande un terminal d'au moins 82 × 17 ; les menus s'accommodent
+de bien moins.
 
 ### Rétroéclairage
 

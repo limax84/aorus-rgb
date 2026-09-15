@@ -167,7 +167,11 @@ Conséquence à connaître : `flash_brightness: "inherit"` fait flasher chaque t
 ## 8. Console de configuration (`src/aorus_tui.py`)
 
 - Lancée par `aorus rgb config`. Bibliothèque standard uniquement (`curses`) : aucune dépendance ajoutée au projet.
-- Structure en menus imbriqués, plus un plan du clavier pour les touches personnalisées.
+- Structure en menus imbriqués, plus un plan du clavier pour les touches personnalisées et un manuel intégré (`?`).
+- **Tout écran passe par `Console.frame(titre, sous-titre)`**, qui dessine le cadre et renvoie `(première ligne de contenu, largeur intérieure)`. `AORUS RGB` ancre le coin haut-gauche, le nom de l'écran le coin haut-droit. Le bas du cadre réserve toujours quatre lignes : séparateur, message, rappel des touches, bordure — la place du message ne bouge donc jamais.
+- `Console.write()` est le seul point de dessin : il borne à la fenêtre et avale le `curses.error` de la toute dernière cellule, qui est un faux positif. Ne pas appeler `addnstr()` directement, la bordure droite se ferait manger.
+- `MIN_WIDTH` et `MIN_HEIGHT` sont **dérivés de `KEYBOARD_ROWS`**, pas écrits en dur : ajouter une touche au plan met à jour la contrainte toute seule.
+- **`KeyboardInterrupt` est rattrapé dans `run_tui()`** : Ctrl+C est une façon légitime de fermer la console. `curses.wrapper()` a déjà rendu le terminal à ce moment-là, une trace d'appels par-dessus ne serait que du bruit.
 - `KEYBOARD_ROWS` est la disposition physique affichée ; c'est de la présentation, elle n'a donc rien à faire dans `aorus_rgb.py`. `KEY_COMPOSE` en est volontairement absent : il partage la LED 66 avec `KEY_MENU` et ne serait qu'un second arrêt du curseur sur la même lumière.
 - `Palette` convertit le RGB vers le cube 256 couleurs et alloue les paires curses à la demande : chaque touche s'affiche dans sa vraie couleur résolue.
 - Toute modification est écrite et signalée immédiatement (`Console.commit`), le vrai clavier servant d'aperçu ; `u` annule sur une pile de 30 états.

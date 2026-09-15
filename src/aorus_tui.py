@@ -60,21 +60,32 @@ KEYBOARD_ROWS = [
      ("KEY_KP0", "0"), ("KEY_KPDOT", ".")],
 ]
 
-CELL = 4            # width of one key cell, label included
-MIN_WIDTH = 82      # widest row plus the side borders
-MIN_HEIGHT = 22
+CELL = 4                                                    # width of one key cell, label included
+LAYOUT_WIDTH = max(len([c for c in row if c]) * CELL + CELL // 2
+                   for row in KEYBOARD_ROWS)                # widest row, gap included
+MIN_WIDTH = LAYOUT_WIDTH + 4                                # plus the frame and its margins
+MIN_HEIGHT = len(KEYBOARD_ROWS) + 11                        # rows, title, status and footer band
 
 # Groups offered by the `g` shortcut on the keyboard map.
 GROUPS = ["wasd", "zqsd", "fkeys", "modifiers", "nav", "numpad", "digits",
           "arrows", "lettres", "all"]
 
 
-# ----------------- COLORS -----------------
+# ----------------- CHROME -----------------
+
+# Box drawing for the frame every screen sits in.
+TL, TR, BL, BR, HBAR, VBAR, LTEE, RTEE = "┌", "┐", "└", "┘", "─", "│", "├", "┤"
+CURSOR = "▸"
+
+# xterm-256 indices for the interface itself, kept apart from the key colors.
+ACCENT, MUTED, OK, WARN = 39, 244, 42, 203
+
 
 class Palette:
-    """Maps RGB to curses color pairs, over the 256-color cube.
+    """Curses color pairs, allocated on demand over the 256-color cube.
 
-    Pairs are allocated on demand and cached: a keyboard map holds at most a
+    One cache serves both the interface chrome (fixed indices) and the key
+    colors (nearest index to an RGB triplet); a keyboard map holds at most a
     handful of distinct colors, far below the terminal's pair budget.
     """
 
@@ -95,18 +106,23 @@ class Palette:
             return 16 if level == 0 else (231 if level == 25 else 231 + level)
         return 16 + 36 * round(r / 51) + 6 * round(g / 51) + round(b / 51)
 
-    def attr(self, rgb):
-        """Curses attribute drawing text in (approximately) this color."""
+    def pair(self, index):
+        """Curses attribute drawing text in this xterm-256 color."""
         if not self.enabled:
-            return curses.A_DIM if max(rgb) < 40 else curses.A_NORMAL
-        idx = self.to_256(rgb)
-        if idx not in self.pairs:
+            return curses.A_NORMAL
+        if index not in self.pairs:
             if self.next_pair >= min(curses.COLOR_PAIRS, 256):
                 return curses.A_NORMAL
-            curses.init_pair(self.next_pair, idx, -1)
-            self.pairs[idx] = curses.color_pair(self.next_pair)
+            curses.init_pair(self.next_pair, index, -1)
+            self.pairs[index] = curses.color_pair(self.next_pair)
             self.next_pair += 1
-        return self.pairs[idx]
+        return self.pairs[index]
+
+    def attr(self, rgb):
+        """Curses attribute for a key's resolved color."""
+        if not self.enabled:
+            return curses.A_DIM if max(rgb) < 40 else curses.A_NORMAL
+        return self.pair(self.to_256(rgb))
 
 
 # ----------------- CONSOLE -----------------
@@ -167,37 +183,75 @@ class Console:
 
     # --- drawing ---------------------------------------------------------
 
-    def frame(self, title, subtitle=""):
-        """Clear the screen and draw the title bar. Returns the first free row."""
-        self.scr.erase()
-        width = self.scr.getmaxyx()[1]
-        self.scr.attron(curses.A_BOLD)
-        self.scr.addnstr(0, 0, f" AORUS RGB · {title}".ljust(width - 1), width - 1)
-        self.scr.attroff(curses.A_BOLD)
-        if subtitle:
-            self.scr.addnstr(1, 1, subtitle, width - 2, curses.A_DIM)
-        return 3 if subtitle else 2
-
-    def footer(self, hint):
-        """Draw the hint line and the last message at the bottom of the screen."""
+    def write(self, y, x, text, attr=curses.A_NORMAL):
+        """Draw clipped to the window, last column included."""
         height, width = self.scr.getmaxyx()
+        if not (0 <= y < height) or x >= width:
+            return
+        try:
+            self.scr.addnstr(y, x, text, width - x, attr)
+        except curses.error:
+            # Filling the bottom-right cell moves the cursor off the window.
+            # The glyph lands all the same, so the error is not ours to report.
+            pass
+
+    def frame(self, title, subtitle=""):
+        """Draw the window frame and return (first content row, inner width).
+
+        Every screen sits in the same box: `AORUS RGB` anchors the top-left, the
+        screen's own name the top-right, so the title tells you where you are.
+        """
+        self.scr.erase()
+        height, width = self.scr.getmaxyx()
+        inner = max(0, width - 2)
+        chrome = self.palette.pair(MUTED)
+
+        head = f"{TL}{HBAR} AORUS RGB "
+        tail = f" {title} {HBAR}{TR}"
+        self.write(0, 0, head + HBAR * max(0, width - len(head) - len(tail)), chrome)
+        self.write(0, max(len(head), width - len(tail)), tail, chrome)
+        for y in range(1, height - 1):
+            self.write(y, 0, VBAR, chrome)
+            self.write(y, width - 1, VBAR, chrome)
+        self.write(height - 1, 0, BL + HBAR * inner + BR, chrome)
+
+        # Footer band: separator, message line, key hints.
+        self.write(height - 4, 0, LTEE + HBAR * inner + RTEE, chrome)
+        if subtitle:
+            self.write(1, 2, subtitle[:inner - 2], self.palette.pair(MUTED))
+        return (3 if subtitle else 2), inner
+
+    def footer(self, hints, status=""):
+        """Draw the key hints and the last message inside the frame.
+
+        Both are clipped short of the right border: a long hint line must not
+        eat the frame it sits in.
+        """
+        height, width = self.scr.getmaxyx()
+        room = max(0, width - 4)
         if self.message:
-            self.scr.addnstr(height - 2, 1, self.message, width - 2, curses.A_BOLD)
-        self.scr.addnstr(height - 1, 1, hint, width - 2, curses.A_DIM)
+            self.write(height - 3, 2, self.message[:room], self.palette.pair(ACCENT) | curses.A_BOLD)
+        if status and len(hints) + len(status) + 5 <= room:
+            self.write(height - 2, width - len(status) - 2, status,
+                       self.palette.pair(OK if status.startswith("●") else WARN))
+            room -= len(status) + 3
+        self.write(height - 2, 2, hints[:room], self.palette.pair(MUTED))
         self.scr.refresh()
 
+    def service_status(self):
+        return "● service actif" if is_service_active() else "○ service inactif"
+
     def ask(self, label, default=""):
-        """Read a line of text at the bottom of the screen. Returns None on Esc."""
+        """Read a line of text on the hint line. Empty input returns `default`."""
         height, width = self.scr.getmaxyx()
-        self.scr.move(height - 1, 0)
-        self.scr.clrtoeol()
-        self.scr.addnstr(height - 1, 1, label, width - 2, curses.A_BOLD)
+        self.write(height - 2, 1, " " * max(0, width - 3))
+        self.write(height - 2, 2, label, self.palette.pair(ACCENT) | curses.A_BOLD)
         self.scr.refresh()
 
         curses.curs_set(1)
         curses.echo()
         try:
-            raw = self.scr.getstr(height - 1, min(len(label) + 2, width - 2), 40)
+            raw = self.scr.getstr(height - 2, min(len(label) + 3, width - 2), 40)
             text = raw.decode("utf-8", "replace").strip()
         except (curses.error, KeyboardInterrupt):
             text = ""
@@ -206,24 +260,28 @@ class Console:
             curses.curs_set(0)
         return text or default
 
-    def menu(self, title, items, hint="↑↓ naviguer · ↵ ouvrir · q retour"):
+    def menu(self, title, items, hints="↑↓ naviguer   ↵ ouvrir   ? aide   q retour"):
         """Run a vertical menu. `items` is a list of (label, value, handler).
 
-        The handler takes the console and returns True to stay on the menu.
-        Redrawn after every action so the shown values always match the config.
+        The handler takes the console and returns False to leave the menu.
+        Rebuilt on every keystroke so the shown values always match the config.
         """
         index = 0
         while True:
             self.reload()
             rows = items(self) if callable(items) else items
             index = max(0, min(index, len(rows) - 1))
-            top = self.frame(title)
-            width = self.scr.getmaxyx()[1]
+            top, inner = self.frame(title)
+
             for i, (label, value, _) in enumerate(rows):
-                attr = curses.A_REVERSE if i == index else curses.A_NORMAL
-                line = f"  {label:<26}{value}"
-                self.scr.addnstr(top + i, 1, line.ljust(width - 3), width - 3, attr)
-            self.footer(hint)
+                selected = i == index
+                self.write(top + i, 2, CURSOR if selected else " ",
+                           self.palette.pair(ACCENT) | curses.A_BOLD)
+                self.write(top + i, 4, f"{label:<26}",
+                           curses.A_BOLD if selected else curses.A_NORMAL)
+                self.write(top + i, 30, str(value),
+                           self.palette.pair(ACCENT if selected else MUTED))
+            self.footer(hints, self.service_status())
 
             key = self.scr.getch()
             self.message = ""
@@ -231,14 +289,144 @@ class Console:
                 index -= 1
             elif key in (curses.KEY_DOWN, ord("j")):
                 index += 1
-            elif key in (ord("u"),):
+            elif key == ord("u"):
                 self.undo()
+            elif key in (ord("?"), ord("h")):
+                screen_help(self)
             elif key in (27, ord("q")):
                 return
             elif key in (curses.KEY_ENTER, 10, 13, ord(" ")):
                 if rows[index][2](self) is False:
                     return
             index %= max(1, len(rows))
+
+
+# ----------------- MANUAL -----------------
+
+def _spaced(entries):
+    """Insert a blank line before each section, so the manual breathes."""
+    out = []
+    for entry in entries:
+        if entry[0] == "t" and out:
+            out.append(("", ""))
+        out.append(entry)
+    return out
+
+
+# (style, texte) : "t" titre de section, "k" ligne touche/commande, "" paragraphe.
+MANUAL = _spaced([
+    ("t", "LA CONSOLE"),
+    ("", "Chaque modification est enregistrée et envoyée au clavier aussitôt :"),
+    ("", "le clavier sous vos doigts est l'aperçu. La ligne de commande peut"),
+    ("", "servir en même temps, les deux côtés se voient en direct."),
+    ("k", "↑ ↓        Naviguer dans un menu"),
+    ("k", "↵          Ouvrir / basculer le réglage sélectionné"),
+    ("k", "u          Annuler la dernière modification (30 niveaux)"),
+    ("k", "?          Afficher ce manuel"),
+    ("k", "q  Échap   Revenir en arrière, puis quitter"),
+
+    ("t", "PLAN DU CLAVIER"),
+    ("", "Chaque touche s'affiche dans la couleur que le démon lui calcule."),
+    ("", "Une action vise les touches marquées, ou à défaut celle sous le curseur."),
+    ("k", "← → ↑ ↓    Déplacer le curseur"),
+    ("k", "espace     Marquer / démarquer la touche"),
+    ("k", "g          Marquer un groupe entier (wasd, fkeys, modifiers, nav…)"),
+    ("k", "a          Tout marquer / tout démarquer"),
+    ("k", "c          Couleur des touches visées"),
+    ("k", "b          Intensité des touches visées"),
+    ("k", "p          Pinceau : une couleur, puis chaque déplacement peint"),
+    ("k", "r          Réinitialiser (retour à la couleur globale)"),
+
+    ("t", "VALEURS ACCEPTÉES"),
+    ("k", "Couleur    nom (cyan, red, violet…), #hex ou hex nu (028391),"),
+    ("k", "           r,g,b, theme (suit le thème Omarchy), inherit"),
+    ("k", "Intensité  0 à 10, ou inherit"),
+    ("", "inherit reprend le réglage du niveau au-dessus au lieu de le figer."),
+    ("", "Synonymes : auto, null, ou une valeur vide."),
+    ("", "Attention : none est un synonyme de noir, pas un héritage."),
+
+    ("t", "HÉRITAGE EN CASCADE"),
+    ("k", "clavier    bg_color + brightness"),
+    ("k", "  touche   custom_keys[*].color + brightness"),
+    ("k", "    flash  flash_color + flash_brightness"),
+    ("", "Le flash hérité prend la couleur de la touche frappée, pas du fond."),
+    ("", "L'indicateur de workspace se greffe au-dessus de la touche, mêmes règles."),
+
+    ("t", "LIGNE DE COMMANDE"),
+    ("k", "aorus rgb config                    Ouvre cette console"),
+    ("k", "aorus rgb status                    État complet du clavier"),
+    ("k", "aorus rgb on | off | toggle         Rétroéclairage"),
+    ("k", "aorus rgb brightness <0-10>         Intensité du clavier"),
+    ("k", "aorus rgb color <couleur>           Couleur globale"),
+    ("k", "aorus rgb key <touches> <coul[:i]>  Colorie des touches"),
+    ("k", "aorus rgb key <touches> reset       Retour à la couleur globale"),
+    ("k", "aorus rgb key list | clear          Lister, tout effacer"),
+    ("k", "aorus rgb flash on | off            Flash à la frappe"),
+    ("k", "aorus rgb flash color <couleur>     Couleur du flash"),
+    ("k", "aorus rgb flash brightness <0-10>   Intensité du flash"),
+    ("k", "aorus rgb workspace on | off        Indicateur de workspace"),
+    ("k", "aorus rgb workspace color <coul>    Couleur du chiffre actif"),
+    ("k", "aorus rgb workspace brightness <n>  Intensité du chiffre actif"),
+    ("k", "aorus rgb workspace dark [on|off]   Visible clavier éteint"),
+    ("k", "aorus rgb preset save|load <nom>    Presets"),
+    ("k", "aorus rgb preset list|delete <nom>"),
+    ("k", "aorus rgb <nom-de-preset>           Raccourci de preset load"),
+    ("k", "aorus rgb restart                   Redémarre le service"),
+
+    ("t", "NOMS DE TOUCHES"),
+    ("", "Français et anglais, accents optionnels :"),
+    ("k", "super win meta · ctrl · alt altgr · shift maj · echap escape"),
+    ("k", "entree return · suppr delete · retour backspace · espace space"),
+    ("k", "tab · caps verrmaj · fn · menu · pause · numlock verrnum"),
+    ("k", "debut home · fin end · pageup · pagedown"),
+    ("k", "haut bas gauche droite · fleches arrows"),
+    ("t", "GROUPES"),
+    ("k", "wasd · zqsd · fkeys fonctions · modifiers · nav · numpad pavenum"),
+    ("k", "digits chiffres · lettres · all"),
+
+    ("t", "OÙ VIVENT LES RÉGLAGES"),
+    ("k", "~/.config/aorus-rgb/config.json     Configuration active"),
+    ("k", "~/.config/aorus-rgb/presets/        Presets enregistrés"),
+    ("k", "systemctl --user status aorus-rgb   État du service"),
+])
+
+
+def screen_help(console):
+    """Scrollable manual: console keys, accepted values and CLI commands."""
+    offset = 0
+    while True:
+        top, inner = console.frame("Manuel")
+        height = console.scr.getmaxyx()[0]
+        page = max(1, height - 4 - top)
+        offset = max(0, min(offset, len(MANUAL) - page))
+
+        for i, (style, text) in enumerate(MANUAL[offset:offset + page]):
+            if style == "t":
+                console.write(top + i, 2, text, console.palette.pair(ACCENT) | curses.A_BOLD)
+            elif style == "k":
+                console.write(top + i, 4, text, curses.A_NORMAL)
+            else:
+                console.write(top + i, 4, text, console.palette.pair(MUTED))
+
+        position = f"{offset + 1}-{min(offset + page, len(MANUAL))} / {len(MANUAL)}"
+        console.footer("↑↓ défiler   PgUp/PgDn page   g début   G fin   q retour", position)
+
+        key = console.scr.getch()
+        if key in (27, ord("q"), ord("?")):
+            return
+        elif key in (curses.KEY_DOWN, ord("j")):
+            offset += 1
+        elif key in (curses.KEY_UP, ord("k")):
+            offset -= 1
+        elif key == curses.KEY_NPAGE:
+            offset += page
+        elif key == curses.KEY_PPAGE:
+            offset -= page
+        elif key == ord("g"):
+            offset = 0
+        elif key == ord("G"):
+            offset = len(MANUAL)
+        offset = max(0, offset)
 
 
 # ----------------- PROMPT HELPERS -----------------
@@ -450,7 +638,7 @@ def screen_keys(console):
     while True:
         console.reload()
         light = console.lighting()
-        top = console.frame(
+        top, inner = console.frame(
             "Touches personnalisées",
             f"Fond {fmt_color(console.cfg.get('bg_color'))} "
             f"({fmt_brightness(console.cfg.get('brightness'))}) · "
@@ -458,14 +646,17 @@ def screen_keys(console):
 
         height, width = console.scr.getmaxyx()
         if width < MIN_WIDTH or height < MIN_HEIGHT:
-            console.scr.addnstr(top, 1, f"Terminal trop petit : {MIN_WIDTH}x{MIN_HEIGHT} minimum.", width - 2)
+            console.write(top, 2, f"Terminal trop petit : {MIN_WIDTH}×{MIN_HEIGHT} minimum,",
+                          console.palette.pair(WARN))
+            console.write(top + 1, 2, f"actuellement {width}×{height}.")
             console.footer("q retour")
             if console.scr.getch() in (27, ord("q")):
                 return
             continue
 
+        left = max(2, (inner - LAYOUT_WIDTH) // 2 + 1)
         for r, cells in enumerate(KEYBOARD_ROWS):
-            x = 1
+            x = left
             for i, cell in enumerate(cells):
                 if cell is None:
                     x += CELL // 2
@@ -477,7 +668,7 @@ def screen_keys(console):
                     attr |= curses.A_BOLD | curses.A_UNDERLINE
                 if r == row and i == nav[r][col]:
                     attr |= curses.A_REVERSE
-                console.scr.addnstr(top + r, x, label.center(CELL - 1), CELL - 1, attr)
+                console.write(top + r, x, label.center(CELL - 1), attr)
                 x += CELL
 
         name = current()
@@ -485,19 +676,24 @@ def screen_keys(console):
         detail = (f"{fmt_color(info.get('color'))} ({fmt_brightness(info.get('brightness'))})"
                   if info else "hérite du clavier")
         status = top + len(KEYBOARD_ROWS) + 1
-        console.scr.addnstr(status, 1, f"{name} · {detail}", width - 2, curses.A_BOLD)
+        console.write(status, left, CURSOR + " " + name, console.palette.pair(ACCENT) | curses.A_BOLD)
+        console.write(status, left + len(name) + 4, detail, curses.A_BOLD)
         selection = f"{len(marks)} marquée(s)" if marks else "aucune marque"
-        painting = f" · pinceau {fmt_color(brush[0])} ({fmt_brightness(brush[1])})" if brush else ""
-        console.scr.addnstr(status + 1, 1, selection + painting, width - 2, curses.A_DIM)
+        painting = (f"   pinceau actif : {fmt_color(brush[0])} ({fmt_brightness(brush[1])})"
+                    if brush else "")
+        console.write(status + 1, left, selection + painting,
+                      console.palette.pair(ACCENT if brush else MUTED))
 
-        console.footer("←→↑↓ déplacer · espace marquer · c couleur · b intensité · "
-                       "p pinceau · g groupe · a tout · r reset · u annuler · q retour")
+        console.footer("←→↑↓ déplacer   espace marquer   c couleur   b intensité   "
+                       "p pinceau   ? aide   q retour", console.service_status())
 
         key = console.scr.getch()
         console.message = ""
 
         if key in (27, ord("q")):
             return
+        elif key in (ord("?"), ord("H")):
+            screen_help(console)
         elif key == curses.KEY_LEFT:
             col -= 1
         elif key == curses.KEY_RIGHT:
@@ -577,12 +773,12 @@ def screen_main(console):
             ("Presets", f"{len(list_presets())} enregistré(s)", _open(screen_presets)),
             ("Intégration OS",
              f"workspace {c.workspace}" if c.cfg.get("workspace_key") else "désactivée", _open(screen_os)),
+            ("Manuel", "touches et commandes", _open(screen_help)),
             ("Quitter", "", lambda c: False),
         ]
 
-    service = "service actif" if is_service_active() else "SERVICE INACTIF"
     console.menu("Console de configuration", rows,
-                 f"↑↓ naviguer · ↵ ouvrir · u annuler · q quitter · {service}")
+                 "↑↓ naviguer   ↵ ouvrir   u annuler   ? manuel   q quitter")
 
 
 def _open(screen):
@@ -600,4 +796,10 @@ def run_tui():
 
     # curses draws bytes: without the user locale the arrow glyphs come out mangled.
     locale.setlocale(locale.LC_ALL, "")
-    curses.wrapper(main)
+    try:
+        curses.wrapper(main)
+    except KeyboardInterrupt:
+        # Ctrl+C is a legitimate way to close the console. curses.wrapper has
+        # already restored the terminal by the time we get here; printing a
+        # traceback over it would be noise, not information.
+        pass
