@@ -241,10 +241,12 @@ class Controller:
     def connect(self): pass
     set_hardware_reactive = set_hardware_off = send_frame = frame
 class Keyboard:
-    def __init__(self): self.fd = os.open(os.devnull, os.O_RDONLY)
+    # A pipe nobody writes to, so select() blocks on it the way a real evdev
+    # node does. /dev/null would read as always-ready and spin the loop.
+    def __init__(self): self.fd, self._w = os.pipe()
     def fileno(self): return self.fd
     def read(self): return []
-    def close(self): os.close(self.fd)
+    def close(self): os.close(self.fd); os.close(self._w)
 class Watcher:
     sock = active = None
     def poll(self): return False
